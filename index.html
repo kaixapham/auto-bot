@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Auto-bot</title>
+  <style>
+    html,body{margin:0;height:100%;background:#0b0d10;color:#cfe9d0;font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+    #ui{position:fixed;left:16px;bottom:16px;right:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    button{background:#16201a;color:#b8ff9e;border:1px solid #2d4a33;border-radius:6px;padding:6px 12px;cursor:pointer}
+    button:hover{background:#1e2e23}
+    input[type=range]{flex:1;min-width:200px;accent-color:#6cff4a}
+    #frame{min-width:70px;text-align:right;font-variant-numeric:tabular-nums}
+    #hint{position:fixed;top:16px;left:16px;opacity:.7}
+  </style>
+</head>
+<body>
+  <div id="hint">Auto-bot · click để bật âm thanh · kéo chuột để xoay</div>
+  <div id="ui">
+    <button id="play">▶ Play</button>
+    <button id="toJet">Robot → Jet</button>
+    <button id="toRobot">Jet → Robot</button>
+    <button id="follow">Camera follow: on</button>
+    <input id="scrub" type="range" min="1" max="250" step="1" value="1" />
+    <span id="frame">f 1</span>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
