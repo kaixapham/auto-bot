@@ -447,6 +447,8 @@ const ENGINE_OVERRIDE = {
 const STORE = 'autobot-render-v2';
 const PRESET_KEY = 'autobot-presets', LAST_PRESET_KEY = 'autobot-preset-last';
 const presets = (() => { try { return JSON.parse(localStorage.getItem(PRESET_KEY) || '{}'); } catch (e) { return {}; } })();
+// first visit (nothing saved in this browser): start from the presets shipped with the site
+if (!Object.keys(presets).length) Object.assign(presets, await fetch(BASE + 'presets.json').then(r => (r.ok ? r.json() : {})).catch(() => ({})));
 const lastPreset = (() => { try { return localStorage.getItem(LAST_PRESET_KEY); } catch (e) { return null; } })();
 // startup: the last saved/loaded preset (else the first one) wins over the auto-saved session state
 const startPreset = lastPreset in presets ? lastPreset : Object.keys(presets)[0];
@@ -457,6 +459,7 @@ if (!(S.engine in ENGINE_OVERRIDE)) S.engine = 'EEVEE';
 delete S.sunOrbit;   // the sun no longer orbits on its own
 if (!S.ptQuality) Object.assign(S, { ptQuality: 'Nhanh' }, PT_QUALITY['Nhanh']);   // older saved state: start on the fast profile
 const BUILTIN_HDRI = { Studio: roomEnv, 'Không': null };
+const SHIPPED_HDRI = ['HDR_hazy_nebulae'];   // public/hdri/<name>.hdr, loaded in the background; not deletable
 const hdriTex = { ...BUILTIN_HDRI };
 const wantedHdri = S.hdri;   // may be an imported HDRI that is restored from IndexedDB below
 if (!(S.hdri in hdriTex)) S.hdri = 'Studio';
@@ -639,7 +642,7 @@ const panel = createPanel({
     { type: 'section', title: 'World', open: true, controls: [
       { type: 'select', key: 'hdri', label: 'HDRI', options: () => Object.keys(hdriTex) },
       hdriFile,
-      { type: 'button', label: 'Xoá HDRI đang chọn', confirm: true, confirmLabel: 'Bấm lần nữa để xoá', when: s => !(s.hdri in BUILTIN_HDRI), onClick: () => deleteHDRI() },
+      { type: 'button', label: 'Xoá HDRI đang chọn', confirm: true, confirmLabel: 'Bấm lần nữa để xoá', when: s => !(s.hdri in BUILTIN_HDRI) && !SHIPPED_HDRI.includes(s.hdri), onClick: () => deleteHDRI() },
       { type: 'slider', key: 'envInt', label: 'Strength', min: 0, max: 5, step: 0.01 },
       { type: 'slider', key: 'envRot', label: 'Rotation', min: -180, max: 180, step: 1, unit: '°' },
       { type: 'segmented', key: 'bgMode', label: 'Nền', options: [{ value: 'HDRI', label: 'HDRI' }, { value: 'Màu', label: 'Màu đơn' }] },
@@ -777,7 +780,7 @@ async function loadHDRI(file) {
   } catch (e) { alert('Không đọc được HDRI: ' + e.message); }
 }
 function deleteHDRI() {
-  const n = S.hdri; if (n in BUILTIN_HDRI) return;
+  const n = S.hdri; if (n in BUILTIN_HDRI || SHIPPED_HDRI.includes(n)) return;
   hdriTex[n]?.dispose(); delete hdriTex[n]; idb.del(n); S.hdri = 'Studio'; apply(); panel.refresh();
 }
 // restore previously imported HDRIs
@@ -786,6 +789,9 @@ idb.all().then(async list => {
   if (wantedHdri in hdriTex) S.hdri = wantedHdri;
   if (list.length) { apply(); panel.refresh(); }
 });
+Promise.all(SHIPPED_HDRI.map(async n => {
+  try { const t = await new HDRLoader().loadAsync(`${BASE}hdri/${n}.hdr`); t.mapping = THREE.EquirectangularReflectionMapping; hdriTex[n] ??= t; } catch (e) {}
+})).then(() => { if (wantedHdri in hdriTex) S.hdri = wantedHdri; apply(); panel.refresh(); });
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadHDRI(f); });
 apply();
