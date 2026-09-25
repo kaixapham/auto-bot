@@ -4,25 +4,27 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Auto-bot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400..700&display=swap" rel="stylesheet" />
   <style>
-    html,body{margin:0;height:100%;background:#0b0d10;color:#cfe9d0;font:13px/1.4 system-ui,sans-serif;overflow:hidden}
-    #ui{position:fixed;left:16px;bottom:16px;right:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    button{background:#16201a;color:#b8ff9e;border:1px solid #2d4a33;border-radius:6px;padding:6px 12px;cursor:pointer}
-    button:hover{background:#1e2e23}
-    input[type=range]{flex:1;min-width:200px;accent-color:#6cff4a}
-    #frame{min-width:70px;text-align:right;font-variant-numeric:tabular-nums}
-    #hint{position:fixed;top:16px;left:16px;opacity:.7}
+    html,body{margin:0;height:100%;background:#000;overflow:hidden}
+    canvas{display:block}
   </style>
 </head>
 <body>
-  <div id="hint">Auto-bot · click để bật âm thanh · kéo chuột để xoay</div>
-  <div id="ui">
-    <button id="play">▶ Play</button>
-    <button id="toJet">Robot → Jet</button>
-    <button id="toRobot">Jet → Robot</button>
-    <button id="follow">Camera follow: on</button>
-    <input id="scrub" type="range" min="1" max="250" step="1" value="1" />
-    <span id="frame">f 1</span>
+  <div class="tc-hint">Auto-bot · click để bật âm thanh · kéo chuột để xoay</div>
+  <div class="tc-toolbar tc-surface">
+    <button class="tc-btn" id="play" aria-label="Play / Pause"></button>
+    <span class="tc-sep"></span>
+    <button class="tc-btn" id="toJet">Robot → Jet</button>
+    <button class="tc-btn" id="toRobot">Jet → Robot</button>
+    <span class="tc-sep"></span>
+    <div id="scrub"></div>
+    <span class="tc-frame" id="frame">f 1</span>
+    <button class="tc-btn" id="follow" aria-pressed="true" title="Camera bám theo robot">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="2.2"/><path d="M7 1v2.2M7 10.8V13M1 7h2.2M10.8 7H13"/></svg><span class="tc-label-wide">Follow</span>
+    </button>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>
