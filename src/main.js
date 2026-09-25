@@ -15,7 +15,9 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { createPanel, slider } from './panel.js';
 
-const meta = await (await fetch('/anim.json')).json();
+// BASE_URL: '/' in dev, './' in the build so it also works from a sub-path (GitHub Pages)
+const BASE = import.meta.env.BASE_URL;
+const meta = await (await fetch(BASE + 'anim.json')).json();
 const FPS = meta.fps;
 
 // ---------- renderer / scene ----------
@@ -155,17 +157,17 @@ function tex(p, srgb) {
   if (srgb) t.colorSpace = THREE.SRGBColorSpace; return t;
 }
 const armor = {
-  map: tex('/textures/armor_basecolor.png', true),
-  roughnessMap: tex('/textures/armor_roughness.png'),
-  normalMap: tex('/textures/armor_normal.png'),
-  emissiveMap: tex('/textures/armor_emission.png', true),
+  map: tex(BASE + 'textures/armor_basecolor.png', true),
+  roughnessMap: tex(BASE + 'textures/armor_roughness.png'),
+  normalMap: tex(BASE + 'textures/armor_normal.png'),
+  emissiveMap: tex(BASE + 'textures/armor_emission.png', true),
 };
 
 // ---------- model ----------
 const draco = new DRACOLoader();
 draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
 const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
-const gltf = await loader.loadAsync('/models/autobot.glb');
+const gltf = await loader.loadAsync(BASE + 'models/autobot.glb');
 const model = gltf.scene; scene.add(model);
 
 // ---------- VFX shaders (soft additive glow instead of flat unlit cones/rings) ----------
@@ -297,10 +299,121 @@ const mixer = new THREE.AnimationMixer(model);
 const actions = gltf.animations.map(c => { const a = mixer.clipAction(c); a.play(); a.paused = true; return a; });
 const rootBone = model.getObjectByName('root');
 
+// ---------- space cruise: the jet holds its hover pose and flies through streaking stars ----------
+// the ship stays put (stars move past it); it banks/bobs gently around its own centre and the wheels idle-spin
+let cruise = false, pendingCruise = false, cruiseFade = 0, wheelSpin = 0, swayT = 0;
+const CRUISE_FRAME = meta.clips.hover[0];
+const STAR_N = 1800, STAR_HALF = 90;
+const starGeo = new THREE.BufferGeometry();
+{
+  const pos = new Float32Array(STAR_N * 6), end = new Float32Array(STAR_N * 2), seed = new Float32Array(STAR_N * 2);
+  for (let i = 0; i < STAR_N; i++) {
+    // keep a clear tube around the ship so no streak crosses the hull
+    const r = 5 + Math.pow(Math.random(), 0.7) * 70, a = Math.random() * Math.PI * 2, z = (Math.random() * 2 - 1) * STAR_HALF, k = Math.random();
+    for (let j = 0; j < 2; j++) { pos.set([Math.cos(a) * r, Math.sin(a) * r, z], (i * 2 + j) * 3); end[i * 2 + j] = j; seed[i * 2 + j] = k; }
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  starGeo.setAttribute('aEnd', new THREE.BufferAttribute(end, 1));
+  starGeo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+}
+// uTravel accumulates on the CPU so changing the speed never makes the stars jump
+const starU = { uTravel: { value: 0 }, uLen: { value: 2.2 }, uHalf: { value: STAR_HALF }, uFade: { value: 0 }, uInt: { value: 1 }, uCol: { value: new THREE.Color(0xcfe0ff) } };
+const stars = new THREE.LineSegments(starGeo, new THREE.ShaderMaterial({
+  uniforms: starU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `attribute float aEnd, aSeed; uniform float uTravel, uLen, uHalf, uFade; varying float vA;
+    void main() {
+      vec3 p = position; float sp = 0.6 + 0.8 * aSeed;
+      p.z = mod(p.z - uTravel * sp + uHalf, 2.0 * uHalf) - uHalf - aEnd * uLen * sp;
+      vA = (1.0 - aEnd * 0.95) * smoothstep(uHalf, uHalf * 0.6, abs(p.z)) * uFade * (0.35 + 0.65 * aSeed);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    }`,
+  fragmentShader: 'uniform vec3 uCol; uniform float uInt; varying float vA; void main() { gl_FragColor = vec4(uCol * 2.2 * uInt, vA); }',
+}));
+stars.frustumCulled = false; stars.visible = false; scene.add(stars);
+
 let playing = false, range = [meta.frameStart, meta.frameEnd], cur = meta.frameStart;
 let idle = 0;   // frames since anything moved (drives the Cycles-style accumulation)
 let ptSceneDirty = true;   // skinned pose / visibility changed → path tracer BVH must be rebuilt
+// wheel spin axis + direction, measured from the clip itself (the wheels spin between frames 18 and 104)
+const wheels = [];
 function setFrame(f) { ptSceneDirty = true; cur = f; const t = (f - 1) / FPS; actions.forEach(a => { a.time = Math.min(t, a.getClip().duration); }); mixer.update(0); }
+
+{
+  const bones = []; model.traverse(o => { if (o.isBone && /^wheel/i.test(o.name)) bones.push(o); });
+  setFrame(40); const q0 = bones.map(b => b.quaternion.clone());
+  setFrame(41);
+  bones.forEach((b, i) => {
+    const d = q0[i].clone().invert().multiply(b.quaternion);
+    const axis = new THREE.Vector3(d.x, d.y, d.z);
+    if (axis.lengthSq() < 1e-10) return;
+    wheels.push({ b, axis: axis.normalize().multiplyScalar(Math.sign(d.w) || 1), base: new THREE.Quaternion() });
+  });
+}
+const qSpin = new THREE.Quaternion();
+// the hub (hex cap, cross bars, green lamps) is split off each wheel mesh so it can spin faster than the tyre:
+// its own Skeleton shares the bones but gets an extra spin folded into the wheel bone's inverse bind matrix
+const HUB_R = 0.14;   // tyre starts at r = 0.18 (g_wheel), hub parts stay inside 0.13
+const hubs = [];
+{
+  const v = new THREE.Vector3(), m = new THREE.Matrix4();
+  for (const o of [...bodyMeshes]) {
+    if (!o.isSkinnedMesh || !o.geometry.index) continue;
+    const bi = o.geometry.attributes.skinIndex.getX(0), w = wheels.find(w => w.b === o.skeleton.bones[bi]);
+    if (!w) continue;
+    m.multiplyMatrices(o.skeleton.boneInverses[bi], o.bindMatrix);   // mesh bind space -> wheel bone rest space
+    const P = o.geometry.attributes.position, idx = o.geometry.index.array, hub = [], tyre = [];
+    const inHub = i => { v.fromBufferAttribute(P, i).applyMatrix4(m); return v.addScaledVector(w.axis, -v.dot(w.axis)).length() < HUB_R; };
+    for (let t = 0; t < idx.length; t += 3) (inHub(idx[t]) && inHub(idx[t + 1]) && inHub(idx[t + 2]) ? hub : tyre).push(idx[t], idx[t + 1], idx[t + 2]);
+    if (!hub.length) continue;
+    const g = new THREE.BufferGeometry();
+    for (const k in o.geometry.attributes) g.setAttribute(k, o.geometry.attributes[k]);
+    g.setIndex(hub); o.geometry.setIndex(tyre);
+    const sk = new THREE.Skeleton(o.skeleton.bones, o.skeleton.boneInverses.map(b => b.clone()));
+    const h = new THREE.SkinnedMesh(g, o.material); h.name = o.name + '_hub';
+    h.castShadow = h.receiveShadow = true; h.frustumCulled = false; h.userData.mat = o.material;
+    o.parent.add(h); h.position.copy(o.position); h.quaternion.copy(o.quaternion); h.scale.copy(o.scale);
+    h.bind(sk, o.bindMatrix);
+    bodyMeshes.push(h);
+    hubs.push({ sk, bi, axis: w.axis, inv: o.skeleton.boneInverses[bi] });
+  }
+}
+let hubSpin = 0;
+const hubM = new THREE.Matrix4();
+function setHubSpin(a) { hubs.forEach(h => h.sk.boneInverses[h.bi].copy(hubM.makeRotationAxis(h.axis, a)).multiply(h.inv)); }
+const jetC = new THREE.Vector3(), fwd = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0), side = new THREE.Vector3(), engMid = new THREE.Vector3();
+const qa = new THREE.Quaternion(), qb = new THREE.Quaternion(), qc = new THREE.Quaternion(), ZAXIS = new THREE.Vector3(0, 0, 1);
+function updateCruise(dt) {
+  cruiseFade = Math.min(1, cruiseFade + dt / 1.2);
+  starU.uFade.value = cruiseFade * cruiseFade;
+  starU.uTravel.value = (starU.uTravel.value + dt * S.spSpeed) % 1e5;
+  // hold the hover pose, then layer the idle wheel spin on top
+  setFrame(CRUISE_FRAME);
+  if (S.spWheels) wheelSpin = (wheelSpin + dt * THREE.MathUtils.degToRad(S.spWheelSpeed) * cruiseFade) % (Math.PI * 2);
+  // the mixer only writes a bone when its sampled value changes, so a held frame never resets the wheels:
+  // always rebuild from the captured pose instead of stacking rotations frame after frame
+  wheels.forEach(w => w.b.quaternion.copy(w.base).multiply(qSpin.setFromAxisAngle(w.axis, S.spWheels ? wheelSpin : 0)));
+  hubSpin = (hubSpin + dt * THREE.MathUtils.degToRad(S.spHubSpeed) * cruiseFade) % (Math.PI * 2);
+  setHubSpin(hubSpin);
+  // ship frame: nose = away from the engines
+  model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
+  rootBone.getWorldPosition(jetC);
+  engMid.set(0, 0, 0); engines.forEach(e => engMid.add(e.o.getWorldPosition(tmpV)));
+  engMid.divideScalar(engines.length || 1);
+  fwd.copy(jetC).sub(engMid); fwd.y = 0; if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, 1); fwd.normalize();
+  side.crossVectors(fwd, up);
+  // gentle bank / pitch / yaw + bob, pivoting on the ship's centre
+  swayT += dt * S.spSwaySpeed;
+  const t = swayT, k = cruiseFade, D = THREE.MathUtils.DEG2RAD;
+  qa.setFromAxisAngle(fwd, Math.sin(t * 0.55) * S.spBank * D * k);
+  qb.setFromAxisAngle(side, Math.sin(t * 0.4 + 1) * S.spPitch * D * k);
+  qc.setFromAxisAngle(up, Math.sin(t * 0.27 + 2) * S.spYaw * D * k);
+  model.quaternion.copy(qc).multiply(qb).multiply(qa);
+  model.position.copy(jetC).sub(tmpV.copy(jetC).applyQuaternion(model.quaternion));
+  model.position.y += Math.sin(t * 0.8) * S.spBob * k;
+  // stars stream from nose to tail around the ship
+  stars.position.copy(jetC); stars.quaternion.setFromUnitVectors(ZAXIS, fwd);
+}
+const tmpV = new THREE.Vector3();
 
 // ---------- render settings (Blender-like presets) ----------
 const DPR = Math.min(devicePixelRatio, 1.5);
@@ -315,6 +428,8 @@ const DEFAULTS = {
   look: 'Gốc (Blender)', roughOff: 0, coat: 0, aniso: 0, envRefl: 1, heatTint: false, visorFilm: false,
   grain: 0, vignette: 0, chroma: 0,
   ptQuality: 'Nhanh', ptBounces: 3, ptMaxSamples: 128, ptScale: 0.5, ptFilter: 1, ptDenoise: true, ptDenoiseStr: 5,
+  spSpeed: 55, spDensity: 1, spLen: 2.2, spInt: 1, spColor: '#cfe0ff',
+  spBank: 4, spPitch: 2, spYaw: 1.7, spBob: 0.12, spSwaySpeed: 1, spWheels: true, spWheelSpeed: 15, spHubSpeed: 540,
   sun: false, sunAz: 35, sunEl: 20, sunInt: 4, sunColor: '#fff1dc', sunSize: 3, sunCorona: 1, sunDiskInt: 1, flare: true, flareInt: 1,
 };
 // path tracing speed/quality trade-offs (resolution dominates: 50% = 4× fewer rays per sample)
@@ -323,15 +438,22 @@ const PT_QUALITY = {
   'Cân bằng': { ptScale: 0.75, ptBounces: 5, ptMaxSamples: 512, ptFilter: 0.6, ptDenoise: true, ptDenoiseStr: 3 },
   'Đẹp': { ptScale: 1, ptBounces: 8, ptMaxSamples: 2048, ptFilter: 0.3, ptDenoise: false, ptDenoiseStr: 2 },
 };
-const PRESETS = {
-  EEVEE: { view: 'AgX', bloom: true, bloomStr: 0.9, bloomThr: 1, ao: false, shadowRes: 2048, envInt: 1 },
-  Cycles: { view: 'AgX', bloom: false, ao: false, envInt: 1 },
+// switching engine never rewrites the user's settings: only Workbench (a flat preview mode) overrides a few,
+// and only while it is active
+const ENGINE_OVERRIDE = {
+  EEVEE: {}, Cycles: {},
   Workbench: { view: 'Standard', bloom: false, ao: true, aoInt: 1, shadowRes: 2048, envInt: 1, hdri: 'Studio', bgMode: 'Màu', bgColor: '#3d3d3d' },
 };
 const STORE = 'autobot-render-v2';
-const S = { ...DEFAULTS };
-try { Object.assign(S, JSON.parse(localStorage.getItem(STORE) || '{}')); } catch (e) {}
-if (!(S.engine in PRESETS)) S.engine = 'EEVEE';
+const PRESET_KEY = 'autobot-presets', LAST_PRESET_KEY = 'autobot-preset-last';
+const presets = (() => { try { return JSON.parse(localStorage.getItem(PRESET_KEY) || '{}'); } catch (e) { return {}; } })();
+const lastPreset = (() => { try { return localStorage.getItem(LAST_PRESET_KEY); } catch (e) { return null; } })();
+// startup: the last saved/loaded preset (else the first one) wins over the auto-saved session state
+const startPreset = lastPreset in presets ? lastPreset : Object.keys(presets)[0];
+const S = { ...DEFAULTS }, SET = S;   // SET: the user's settings, for code that shadows S
+if (startPreset) Object.assign(S, presets[startPreset]);
+else try { Object.assign(S, JSON.parse(localStorage.getItem(STORE) || '{}')); } catch (e) {}
+if (!(S.engine in ENGINE_OVERRIDE)) S.engine = 'EEVEE';
 delete S.sunOrbit;   // the sun no longer orbits on its own
 if (!S.ptQuality) Object.assign(S, { ptQuality: 'Nhanh' }, PT_QUALITY['Nhanh']);   // older saved state: start on the fast profile
 const BUILTIN_HDRI = { Studio: roomEnv, 'Không': null };
@@ -398,6 +520,7 @@ function applyLook() {
 }
 
 function apply() {
+  const S = { ...SET, ...ENGINE_OVERRIDE[SET.engine] };
   const cycles = S.engine === 'Cycles', wb = S.engine === 'Workbench';
   renderer.toneMapping = TONE[S.view]; renderer.toneMappingExposure = S.exposure;
   if (renderer.getPixelRatio() !== S.res) { renderer.setPixelRatio(S.res); composer.setPixelRatio(S.res); }
@@ -408,8 +531,10 @@ function apply() {
   if (S.bgMode === 'HDRI' && env) { scene.background = env; scene.backgroundBlurriness = S.bgBlur; scene.backgroundIntensity = S.bgInt; }
   else { scene.background = new THREE.Color(S.bgColor); }
   scene.fog.color.set(S.bgMode === 'HDRI' && env ? S.groundColor : S.bgColor);
-  scene.fog.near = S.bgMode === 'HDRI' && env ? 1e4 : 22;
-  ground.visible = S.ground; groundMat.color.set(S.groundColor);
+  // HDRI backdrop = no fog; far must stay > near or GLSL smoothstep fogs everything solid
+  const noFog = S.bgMode === 'HDRI' && env || cruise;
+  scene.fog.near = noFog ? 1e4 : 22; scene.fog.far = noFog ? 2e4 : 70;
+  ground.visible = S.ground && !cruise; groundMat.color.set(S.groundColor);
   // lights
   key.intensity = S.keyInt; key.color.set(S.keyColor); rim.intensity = S.rimInt; rim.color.set(S.rimColor); hemi.intensity = S.ambient;
   key.castShadow = S.shadows && !S.sun;
@@ -428,15 +553,18 @@ function apply() {
   // VFX
   U.flameInt.value = S.flameInt; U.flameSoft.value = S.flameSoft; U.flameCol.value.set(S.flameColor); U.coreCol.value.set(S.coreColor);
   flames.forEach(o => { o.visible = S.flames; o.scale.set(S.flameSpread, S.flameSpread, S.flameLen); });
-  U.shockInt.value = S.shockInt; U.shockCol.value.set(S.shockColor); shocks.forEach(o => { o.visible = S.shock; });
-  U.flashInt.value = S.flashInt; flashes.forEach(o => { o.visible = S.flash; });
+  U.shockInt.value = S.shockInt; U.shockCol.value.set(S.shockColor); shocks.forEach(o => { o.visible = S.shock && !cruise; });
+  U.flashInt.value = S.flashInt; flashes.forEach(o => { o.visible = S.flash && !cruise; });
   engines.forEach(e => e.l.color.set(S.flameColor));
+  // space cruise stars
+  starU.uLen.value = S.spLen; starU.uInt.value = S.spInt; starU.uCol.value.set(S.spColor);
+  starGeo.setDrawRange(0, Math.round(STAR_N * S.spDensity) * 2);
   // post
   bloom.enabled = S.bloom && !wb; bloom.strength = S.bloomStr; bloom.radius = S.bloomRad; bloom.threshold = S.bloomThr;
   gtao.enabled = S.ao; gtao.blendIntensity = S.aoInt; gtao.updateGtaoMaterial({ radius: S.aoRadius });
   idle = 0;
   ptSync();
-  try { localStorage.setItem(STORE, JSON.stringify(S)); } catch (e) {}
+  try { localStorage.setItem(STORE, JSON.stringify(SET)); } catch (e) {}
 }
 
 // ---------- persistence: imported HDRI files (IndexedDB) + named setting presets ----------
@@ -454,10 +582,8 @@ const idb = (() => {
     all: async () => { try { const db = await open(); return await new Promise(res => { const out = []; const c = db.transaction('hdri').objectStore('hdri').openCursor(); c.onsuccess = () => { const cur = c.result; if (cur) { out.push([cur.key, cur.value]); cur.continue(); } else res(out); }; c.onerror = () => res(out); }); } catch (e) { return []; } },
   };
 })();
-const PRESET_KEY = 'autobot-presets';
-const presets = (() => { try { return JSON.parse(localStorage.getItem(PRESET_KEY) || '{}'); } catch (e) { return {}; } })();
-const presetUI = { name: Object.keys(presets)[0] || '', draft: '' };
-const savePresets = () => { try { localStorage.setItem(PRESET_KEY, JSON.stringify(presets)); } catch (e) {} };
+const presetUI = { name: startPreset || '', draft: '' };
+const savePresets = () => { try { localStorage.setItem(PRESET_KEY, JSON.stringify(presets)); localStorage.setItem(LAST_PRESET_KEY, presetUI.name); } catch (e) {} };
 // saves under the typed name; with no name typed it overwrites the selected preset (or makes "Preset N")
 function savePreset() {
   const name = (presetUI.draft || '').trim() || presetUI.name || `Preset ${Object.keys(presets).length + 1}`;
@@ -467,7 +593,8 @@ function loadPreset(name) {
   if (!presets[name]) return;
   Object.assign(S, DEFAULTS, presets[name]);
   if (!(S.hdri in hdriTex)) S.hdri = 'Studio';
-  presetUI.name = name; apply(); panel.refresh(); panel.toast(`Đã tải "${name}"`);
+  presetUI.name = name; try { localStorage.setItem(LAST_PRESET_KEY, name); } catch (e) {}
+  apply(); panel.refresh(); panel.toast(`Đã tải "${name}"`);
 }
 function deletePreset() {
   const n = presetUI.name; if (!presets[n]) return;
@@ -484,7 +611,6 @@ const panel = createPanel({
   title: 'Render', state: S, defaults: DEFAULTS, storageKey: 'autobot-panel',
   footerActions: () => [{ label: 'Save', primary: true, title: 'Lưu các setting hiện tại thành preset', onClick: () => savePreset() }],
   onChange: k => {
-    if (k === 'engine') Object.assign(S, PRESETS[S.engine]);
     if (k === 'ptQuality') Object.assign(S, PT_QUALITY[S.ptQuality]);
     else if (k.startsWith?.('pt')) S.ptQuality = 'Tuỳ chỉnh';
     apply();
@@ -499,7 +625,7 @@ const panel = createPanel({
       { type: 'slider', key: 'ptFilter', label: 'Lọc đốm sáng (glossy filter)', min: 0, max: 1, step: 0.01, when: s => s.engine === 'Cycles' },
       { type: 'switch', key: 'ptDenoise', label: 'Khử nhiễu (denoise)', when: s => s.engine === 'Cycles' },
       { type: 'slider', key: 'ptDenoiseStr', label: 'Độ khử nhiễu', min: 1, max: 10, step: 0.1, when: s => s.engine === 'Cycles' && s.ptDenoise },
-      { type: 'button', label: 'Bật path tracing (Cycles)', primary: true, when: s => s.engine !== 'Cycles', onClick: () => { S.engine = 'Cycles'; Object.assign(S, PRESETS.Cycles); apply(); panel.refresh(); } },
+      { type: 'button', label: 'Bật path tracing (Cycles)', primary: true, when: s => s.engine !== 'Cycles', onClick: () => { S.engine = 'Cycles'; apply(); panel.refresh(); } },
     ] },
     { type: 'section', title: 'Preset đã lưu', open: true, controls: [
       { type: 'select', label: 'Preset', key: 'name', state: presetUI, options: () => Object.keys(presets).length ? Object.keys(presets) : ['(chưa có preset)'], onPick: v => loadPreset(v) },
@@ -535,6 +661,22 @@ const panel = createPanel({
       { type: 'slider', key: 'sunCorona', label: 'Quầng (corona)', min: 0, max: 3, step: 0.01, when: s => s.sun },
       { type: 'switch', key: 'flare', label: 'Lens flare', when: s => s.sun },
       { type: 'slider', key: 'flareInt', label: 'Độ sáng flare', min: 0, max: 3, step: 0.01, when: s => s.sun && s.flare },
+    ] },
+    { type: 'section', title: 'Bay vũ trụ', open: true, controls: [
+      { type: 'button', label: 'Bật / tắt bay vũ trụ', primary: true, onClick: () => $('space').click() },
+      { type: 'slider', key: 'spSpeed', label: 'Tốc độ bay', min: 0, max: 250, step: 1, unit: ' m/s' },
+      { type: 'slider', key: 'spDensity', label: 'Mật độ sao', min: 0.05, max: 1, step: 0.01, format: v => Math.round(v * 100) + '%' },
+      { type: 'slider', key: 'spLen', label: 'Độ dài vệt sao', min: 0, max: 12, step: 0.1, unit: ' m' },
+      { type: 'slider', key: 'spInt', label: 'Độ sáng sao', min: 0, max: 4, step: 0.01 },
+      { type: 'color', key: 'spColor', label: 'Màu sao' },
+      { type: 'slider', key: 'spBank', label: 'Nghiêng cánh (bank)', min: 0, max: 25, step: 0.1, unit: '°' },
+      { type: 'slider', key: 'spPitch', label: 'Ngóc mũi (pitch)', min: 0, max: 15, step: 0.1, unit: '°' },
+      { type: 'slider', key: 'spYaw', label: 'Lắc hướng (yaw)', min: 0, max: 15, step: 0.1, unit: '°' },
+      { type: 'slider', key: 'spBob', label: 'Nhấp nhô', min: 0, max: 1, step: 0.01, unit: ' m' },
+      { type: 'slider', key: 'spSwaySpeed', label: 'Nhịp chòng chành', min: 0, max: 4, step: 0.01, format: v => '×' + (+v).toFixed(2) },
+      { type: 'switch', key: 'spWheels', label: 'Bánh xe quay' },
+      { type: 'slider', key: 'spWheelSpeed', label: 'Tốc độ bánh', min: 0, max: 120, step: 1, unit: '°/s', when: s => s.spWheels },
+      { type: 'slider', key: 'spHubSpeed', label: 'Tốc độ lõi bánh', min: 0, max: 1440, step: 1, unit: '°/s' },
     ] },
     { type: 'section', title: 'Đèn', controls: [
       { type: 'slider', key: 'keyInt', label: 'Key light', min: 0, max: 10, step: 0.05 },
@@ -652,7 +794,7 @@ apply();
 const listener = new THREE.AudioListener(); camera.add(listener);
 const aload = new THREE.AudioLoader();
 const buffers = {};
-await Promise.all([...new Set(meta.sfx.map(c => c.file))].map(async f => { buffers[f] = await aload.loadAsync('/' + f); }));
+await Promise.all([...new Set(meta.sfx.map(c => c.file))].map(async f => { buffers[f] = await aload.loadAsync(BASE + f); }));
 const live = [];
 function fire(c) {
   const a = new THREE.Audio(listener); a.setBuffer(buffers[c.file]); a.setVolume(c.volume);
@@ -666,12 +808,25 @@ const $ = id => document.getElementById(id);
 const PLAY = '<svg viewBox="0 0 14 14" fill="currentColor"><path d="M4 2.5v9l7.5-4.5z"/></svg>';
 const PAUSE = '<svg viewBox="0 0 14 14" fill="currentColor"><path d="M3.5 2.5h2.5v9H3.5zM8 2.5h2.5v9H8z"/></svg>';
 const setPlaying = p => { playing = p; $('play').innerHTML = p ? PAUSE : PLAY; $('play').setAttribute('aria-pressed', String(p)); };
-function playRange(a, b) { range = [a, b]; setFrame(a); setPlaying(true); }
-$('play').onclick = () => { if (!playing && cur >= range[1]) setFrame(range[0]); setPlaying(!playing); };
+function setCruise(on) {
+  cruise = on; pendingCruise = false; $('space').setAttribute('aria-pressed', String(on));
+  stars.visible = on; cruiseFade = 0; starU.uFade.value = 0; wheelSpin = hubSpin = 0; setHubSpin(0);
+  if (on) { setFrame(CRUISE_FRAME); wheels.forEach(w => w.base.copy(w.b.quaternion)); }
+  else { model.position.set(0, 0, 0); model.quaternion.identity(); wheels.forEach(w => w.b.quaternion.copy(w.base)); setFrame(cur); }
+  apply();
+}
+function playRange(a, b) { if (cruise) setCruise(false); pendingCruise = false; range = [a, b]; setFrame(a); setPlaying(true); }
+$('play').onclick = () => { if (cruise) { setCruise(false); return; } if (!playing && cur >= range[1]) setFrame(range[0]); setPlaying(!playing); };
 $('toJet').onclick = () => playRange(...meta.clips.toJet);
 $('toRobot').onclick = () => playRange(...meta.clips.toRobot);
+// robot → jet first when needed, then cruise
+$('space').onclick = () => {
+  if (cruise) { setCruise(false); return; }
+  if (Math.round(cur) === CRUISE_FRAME) { setCruise(true); return; }
+  playRange(...meta.clips.toJet); pendingCruise = true; $('space').setAttribute('aria-pressed', 'true');
+};
 let follow = true; $('follow').onclick = () => { follow = !follow; $('follow').setAttribute('aria-pressed', String(follow)); };
-const scrub = slider({ min: meta.frameStart, max: meta.frameEnd, step: 1, get: () => cur, set: v => { setPlaying(false); setFrame(v); idle = 0; } });
+const scrub = slider({ min: meta.frameStart, max: meta.frameEnd, step: 1, get: () => cur, set: v => { if (cruise || pendingCruise) setCruise(false); setPlaying(false); setFrame(v); idle = 0; } });
 $('scrub').replaceWith(scrub.el);
 setPlaying(false);
 
@@ -691,8 +846,10 @@ renderer.setAnimationLoop(() => {
     meta.sfx.forEach(c => { if (c.frame > prev && c.frame <= next) fire(c); });
     setFrame(next);
     idle = 0;
+    if (!playing && pendingCruise) { cur = CRUISE_FRAME; setCruise(true); }
   }
-  scrub.draw(); $('frame').textContent = 'f ' + Math.round(cur);
+  if (cruise) updateCruise(dt);
+  scrub.draw(); $('frame').textContent = cruise ? 'vũ trụ' : 'f ' + Math.round(cur);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { panel.setStatus(`${Math.round(fpsN / fpsT)} fps · ${renderer.domElement.width}×${renderer.domElement.height}`); fpsN = fpsT = 0; }
   engines.forEach(e => { e.l.intensity = S.flames ? S.flameLight * 8 * Math.max(e.o.scale.x, e.o.scale.z) * S.flameInt : 0; });
   shocks.forEach(o => { const k = o.scale.x / (shockMax[o.name] || 1); o.material.uniforms.uFade.value = Math.pow(Math.max(0, 1 - k), 1.3); });
@@ -749,7 +906,7 @@ function ptSync() {
 }
 // returns true when the path-traced image was drawn this frame
 function renderPathTraced() {
-  if (S.engine !== 'Cycles' || playing) return false;
+  if (S.engine !== 'Cycles' || playing || cruise) return false;
   if (ptSceneDirty && !ptBuilding) {
     clearTimeout(ptBuildTimer); ptBuilding = true;
     ptBuildTimer = setTimeout(() => { ptBuilding = false; ptBuild(); }, 250);   // debounce scrubbing
