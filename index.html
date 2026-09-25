@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Auto-bot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400..700&display=swap" rel="stylesheet" />
+  <style>
+    html,body{margin:0;height:100%;background:#000;overflow:hidden}
+    canvas{display:block}
+    #boot{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;background:#000;color:#e9edf2;
+      font:500 12px Inter,system-ui,sans-serif;transition:opacity .6s ease}
+    #boot.done{opacity:0;pointer-events:none}
+    .boot-card{width:min(320px,80vw);display:grid;gap:12px}
+    .boot-title{font-weight:700;font-size:15px;letter-spacing:.32em;text-align:center;color:#fff}
+    .boot-bar{height:3px;border-radius:3px;background:#1d2126;overflow:hidden}
+    .boot-bar i{display:block;height:100%;width:0;background:#40ff20;box-shadow:0 0 12px #40ff20;transition:width .25s ease}
+    .boot-row{display:flex;justify-content:space-between;gap:12px;color:#8a929c;font-variant-numeric:tabular-nums}
+    #boot-msg{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #boot button{justify-self:center;margin-top:4px;padding:8px 14px;border-radius:8px;border:0;background:#fff;color:#000;font:600 12px Inter,sans-serif;cursor:pointer}
+  </style>
+  <script type="module" crossorigin src="./assets/index-rvRJ0CsS.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-bvFFw2OI.css">
+</head>
+<body>
+  <!-- boot screen: shown before any script runs, removed once every asset is loaded and the first frames are drawn -->
+  <div id="boot" role="status" aria-live="polite">
+    <div class="boot-card">
+      <div class="boot-title">AUTO-BOT</div>
+      <div class="boot-bar"><i id="boot-fill"></i></div>
+      <div class="boot-row"><span id="boot-msg">Đang khởi động…</span><span id="boot-pct">0%</span></div>
+    </div>
+  </div>
+  <div class="tc-hint">Auto-bot · click để bật âm thanh · kéo chuột để xoay</div>
+  <div class="tc-toolbar tc-surface">
+    <button class="tc-btn" id="play" aria-label="Play / Pause"></button>
+    <span class="tc-sep"></span>
+    <button class="tc-btn" id="toJet">Robot → Jet</button>
+    <button class="tc-btn" id="toRobot">Jet → Robot</button>
+    <button class="tc-btn" id="space" aria-pressed="false" title="Jet bay trong vũ trụ (lặp vô hạn)">Vũ trụ</button>
+    <button class="tc-btn" id="stand" aria-pressed="false" title="Robot đứng, chống tay, ngó quanh">Đứng</button>
+    <button class="tc-btn" id="run" aria-pressed="false" title="Robot chạy (lặp vô hạn)">Chạy</button>
+    <button class="tc-btn" id="mask" aria-pressed="false" title="Mở / đóng mặt nạ chiến đấu (dạng robot)">Mặt nạ</button>
+    <span class="tc-sep"></span>
+    <div id="scrub"></div>
+    <span class="tc-frame" id="frame">f 1</span>
+    <button class="tc-btn" id="follow" aria-pressed="true" title="Camera bám theo robot">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="2.2"/><path d="M7 1v2.2M7 10.8V13M1 7h2.2M10.8 7H13"/></svg><span class="tc-label-wide">Follow</span>
+    </button>
+  </div>
+</body>
+</html>
