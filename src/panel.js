@@ -33,16 +33,17 @@ export function slider({ min, max, step = 0.01, get, set, reset }) {
   return { el, draw };
 }
 
-export function createPanel({ title, state, defaults, schema, onChange, storageKey = 'tc-panel', footerActions }) {
+// className: extra class on the panel (placement); resettable: false hides the reset-everything button
+export function createPanel({ title, state, defaults, schema, onChange, storageKey = 'tc-panel', footerActions, className = '', resettable = true }) {
   const ui = store.get(storageKey, { collapsed: false, open: {} });
-  const root = h('aside', 'tc-panel tc-surface');
+  const root = h('aside', 'tc-panel tc-surface' + (className ? ' ' + className : ''));
   root.dataset.collapsed = String(ui.collapsed);
   const head = h('div', 'tc-head');
   const titleEl = h('h1', null, title);
   const sub = h('span', 'tc-sub');
   const resetBtn = h('button', 'tc-icon-btn', ICON.reset); resetBtn.title = 'Reset tất cả về mặc định';
   const colBtn = h('button', 'tc-icon-btn', ui.collapsed ? ICON.max : ICON.min); colBtn.title = 'Thu gọn / mở rộng';
-  head.append(titleEl, sub, resetBtn, colBtn);
+  head.append(titleEl, sub, ...(resettable ? [resetBtn] : []), colBtn);
   const scroll = h('div', 'tc-scroll');
   const footer = h('div', 'tc-footer');
   const status = h('span', 'tc-status');
@@ -55,9 +56,10 @@ export function createPanel({ title, state, defaults, schema, onChange, storageK
   root.append(head, scroll, footer);
   document.body.append(root);
 
+  const rootState = state;
   const updaters = [];
   const changed = key => { onChange(key); refresh(); };
-  const setVal = (key, v) => { state[key] = v; changed(key); };
+  const setValRoot = (key, v, st = state) => { st[key] = v; changed(key); };
 
   // `confirm: true` → first click arms the button, second click (within 3s) runs it (no native dialogs)
   function button(c) {
@@ -72,7 +74,10 @@ export function createPanel({ title, state, defaults, schema, onChange, storageK
     return b;
   }
 
+  // any control may bind to its own `state` object (e.g. a proxy onto the selected material's settings)
   function control(c) {
+    const state = c.state || rootState;
+    const setVal = (key, v) => setValRoot(key, v, state);
     const row = h('div', 'tc-row');
     const top = h('div', 'tc-row-top');
     const label = h('span', 'tc-label', c.label || '');
@@ -80,7 +85,7 @@ export function createPanel({ title, state, defaults, schema, onChange, storageK
     if (c.type === 'slider') {
       const fmt = c.format || (v => (+v).toFixed(c.step >= 1 ? 0 : 2) + (c.unit || ''));
       const val = h('button', 'tc-value');
-      const s = slider({ min: c.min, max: c.max, step: c.step, get: () => state[c.key], set: v => setVal(c.key, v), reset: () => setVal(c.key, defaults[c.key]) });
+      const s = slider({ min: c.min, max: c.max, step: c.step, get: () => state[c.key], set: v => setVal(c.key, v), reset: () => setVal(c.key, c.default ?? defaults[c.key]) });
       val.onclick = () => {
         const inp = h('input', 'tc-value'); inp.value = state[c.key]; val.replaceWith(inp); inp.focus(); inp.select();
         let closed = false;
@@ -104,15 +109,17 @@ export function createPanel({ title, state, defaults, schema, onChange, storageK
       upd = () => btns.forEach(([b, v]) => b.setAttribute('aria-pressed', String(state[c.key] === v)));
     } else if (c.type === 'select') {
       const sel = h('select', 'tc-select');
-      const fill = () => { const opts = typeof c.options === 'function' ? c.options() : c.options; sel.innerHTML = ''; opts.forEach(o => sel.append(new Option(o, o))); };
+      // options: plain strings, or { value, label } when the shown text differs from the stored value
+      const list = () => (typeof c.options === 'function' ? c.options() : c.options).map(o => (typeof o === 'object' ? o : { value: o, label: o }));
+      const fill = () => { sel.innerHTML = ''; list().forEach(o => sel.append(new Option(o.label, o.value))); };
       // `state`/`onPick` let a select drive something other than the settings object (e.g. saved presets)
       const st = c.state || state;
       sel.onchange = () => { if (c.onPick) { st[c.key] = sel.value; c.onPick(sel.value); } else setVal(c.key, sel.value); };
       top.append(label); row.append(top, sel);
       upd = () => {
-        const opts = typeof c.options === 'function' ? c.options() : c.options;
-        if (sel.options.length !== opts.length || [...sel.options].some((o, i) => o.value !== opts[i])) fill();
-        sel.value = opts.includes(st[c.key]) ? st[c.key] : opts[0];
+        const opts = list();
+        if (sel.options.length !== opts.length || [...sel.options].some((o, i) => o.value !== String(opts[i].value) || o.text !== opts[i].label)) fill();
+        sel.value = opts.some(o => String(o.value) === String(st[c.key])) ? st[c.key] : opts[0]?.value;
       };
       fill();
     } else if (c.type === 'color') {
@@ -124,14 +131,35 @@ export function createPanel({ title, state, defaults, schema, onChange, storageK
       top.append(label); row.append(top, wrap);
       upd = () => { pick.value = state[c.key]; sw.style.background = state[c.key]; if (document.activeElement !== hex) hex.value = state[c.key].replace('#', ''); };
     } else if (c.type === 'file') {
-      const drop = h('div', 'tc-drop', `<b>${c.title}</b><small>${c.hint || ''}</small>`);
-      const inp = h('input'); inp.type = 'file'; inp.accept = c.accept; inp.hidden = true;
+      // `title`/`hint` may be functions (live text); `multiple` hands every dropped file to onFiles
+      const txt = v => (typeof v === 'function' ? v() : v) || '';
+      // `thumb()` → image URL shown as a preview tile (null = empty slot, drawn as a checkerboard)
+      const drop = h('div', 'tc-drop' + (c.compact ? ' tc-drop--compact' : '') + (c.thumb ? ' tc-drop--thumb' : ''),
+        c.thumb ? '<span class="tc-drop-thumb"><img alt=""></span><span class="tc-drop-text"><b></b><small></small></span>' : '<b></b><small></small>');
+      const inp = h('input'); inp.type = 'file'; inp.accept = c.accept; inp.hidden = true; inp.multiple = !!c.multiple;
+      const take = files => { if (!files.length) return; if (c.multiple) c.onFiles(files); else c.onFile(files[0]); };
       drop.onclick = () => inp.click();
-      inp.onchange = () => { if (inp.files[0]) c.onFile(inp.files[0]); inp.value = ''; };
+      inp.onchange = () => { take([...inp.files]); inp.value = ''; };
       drop.ondragover = e => { e.preventDefault(); drop.dataset.over = ''; };
       drop.ondragleave = () => delete drop.dataset.over;
-      drop.ondrop = e => { e.preventDefault(); e.stopPropagation(); delete drop.dataset.over; const f = e.dataTransfer.files[0]; if (f) c.onFile(f); };
+      drop.ondrop = e => { e.preventDefault(); e.stopPropagation(); delete drop.dataset.over; take([...e.dataTransfer.files]); };
       row.append(drop, inp);
+      // optional × to empty the slot (shown only while `canClear()` says there is something to remove)
+      let clr = null;
+      if (c.onClear) {
+        clr = h('button', 'tc-drop-clear', '×'); clr.title = c.clearTitle || 'Xoá, về mặc định'; clr.setAttribute('aria-label', clr.title);
+        clr.onclick = e => { e.stopPropagation(); c.onClear(); };
+        drop.append(clr);
+      }
+      const img = drop.querySelector('img');
+      upd = () => {
+        drop.querySelector('b').textContent = txt(c.title); drop.querySelector('small').textContent = txt(c.hint);
+        if (clr) clr.hidden = !(c.canClear?.() ?? true);
+        if (img) { const u = c.thumb() || ''; if (img.getAttribute('src') !== u) { if (u) img.src = u; else img.removeAttribute('src'); } img.hidden = !u; }
+      };
+    } else if (c.type === 'note') {
+      const d = h('div', 'tc-matinfo'); row.append(d);
+      upd = () => { const t = typeof c.text === 'function' ? c.text() : c.text; if (d.innerHTML !== t) d.innerHTML = t; };
     } else if (c.type === 'button') {
       row.append(button(c));
     } else if (c.type === 'buttons') {

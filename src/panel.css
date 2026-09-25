@@ -208,3 +208,37 @@ input.tc-value { width: 64px; outline: 1px solid var(--tc-accent); background: v
   .tc-toolbar .tc-label-wide { display: none; }
   .tc-hint { display: none; }
 }
+
+.tc-drop--compact { padding: 8px 10px; text-align: left; }
+.tc-drop--compact b { font-size: 12px; }
+
+.tc-drop { position: relative; }
+.tc-drop-clear { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 6px; border: 0; cursor: pointer;
+  background: color-mix(in oklab, var(--tc-fg) 10%, transparent); color: var(--tc-fg); font-size: 15px; line-height: 22px; padding: 0; }
+.tc-drop-clear:hover { background: #e5484d; color: #fff; }
+.tc-drop--compact { padding-right: 34px; }
+
+.tc-drop--thumb { display: grid; grid-template-columns: 52px 1fr; gap: 10px; align-items: center; text-align: left; }
+.tc-drop-thumb { width: 52px; height: 52px; border-radius: 8px; overflow: hidden; border: 1px solid color-mix(in oklab, var(--tc-fg) 14%, transparent);
+  background: repeating-conic-gradient(color-mix(in oklab, var(--tc-fg) 10%, transparent) 0 25%, transparent 0 50%) 0 0 / 12px 12px; }
+.tc-drop-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tc-drop-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+
+/* second panel docked bottom-left, opened by the round button in the corner */
+.tc-panel--left { top: auto; right: auto; left: 12px; bottom: 64px; max-height: calc(100dvh - 90px); }
+.tc-panel--left[hidden] { display: none; }
+.tc-fab { position: fixed; left: 12px; bottom: 12px; z-index: 11; width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center;
+  cursor: pointer; color: var(--tc-fg); border: 0; }
+.tc-fab svg { width: 20px; height: 20px; }
+.tc-fab[aria-pressed="true"] { background: color-mix(in oklab, var(--tc-accent) 35%, var(--tc-bg, #111)); }
+.tc-matinfo { font-size: 11.5px; line-height: 16px; color: var(--tc-fg-60); padding: 2px 2px 0; }
+.tc-matinfo b { color: var(--tc-fg); font-weight: 600; }
+@media (max-width: 900px) { .tc-fab { bottom: 62px; } .tc-panel--left { bottom: 114px; max-height: calc(100dvh - 140px); } }
+@media (max-width: 700px) { .tc-panel--left { left: 12px; right: 12px; width: auto; max-height: 50dvh; } }
+
+.tc-drop--thumb { justify-items: start; }
+.tc-drop-text { align-self: center; justify-self: stretch; text-align: left; align-items: flex-start; }
+.tc-drop--thumb small { line-height: 15px; }
+
+/* watch-only public build: only the action toolbar */
+body.viewer-only .tc-panel, body.viewer-only .tc-fab { display: none !important; }
