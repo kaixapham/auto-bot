@@ -8,7 +8,6 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { TexturePass } from 'three/examples/jsm/postprocessing/TexturePass.js';
-import { WebGLPathTracer, DenoiseMaterial } from 'three-gpu-pathtracer';
 import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
@@ -138,7 +137,7 @@ const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), groundMat);
 ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
 
 // ---------- post ----------
-const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 2 });
+const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 });
 const composer = new EffectComposer(renderer, rt);
 const renderPass = new RenderPass(scene, camera);
 const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
@@ -150,7 +149,7 @@ const sanitize = new ShaderPass({
   fragmentShader: `uniform sampler2D tDiffuse; varying vec2 vUv;
     void main() { vec4 c = texture2D(tDiffuse, vUv);
       if (any(isnan(c)) || any(isinf(c))) c = vec4(0.0, 0.0, 0.0, 1.0);
-      gl_FragColor = vec4(clamp(c.rgb, 0.0, 64.0), c.a); }`,
+      gl_FragColor = vec4(clamp(c.rgb, 0.0, 16.0), c.a); }`,   // a lone hot specular pixel can't bloom into a star
 });
 composer.addPass(renderPass); composer.addPass(gtao); composer.addPass(sanitize); composer.addPass(bloom);
 composer.addPass(new OutputPass());
@@ -185,15 +184,22 @@ composer.addPass(filmic);
 
 // ---------- path tracing ("Cycles"): three-gpu-pathtracer, progressive while nothing moves ----------
 // its linear HDR output goes through the same bloom / tone mapping / filmic passes as the rasterizer
-const pt = new WebGLPathTracer(renderer);
-Object.assign(pt, { renderToCanvas: false, minSamples: 1, renderDelay: 0, fadeDuration: 0, dynamicLowRes: false });
-pt.tiles.set(1, 1);   // whole frame per sample: more samples/sec (UI stays usable at the lower render scales)
-const ptComposer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType }));
-const ptTexPass = new TexturePass(null);
-const denoise = new DenoiseMaterial(); denoise.toneMapped = false;
-const denoisePass = new ShaderPass(denoise, 'map');
-ptComposer.addPass(ptTexPass); ptComposer.addPass(denoisePass); ptComposer.addPass(sanitize); ptComposer.addPass(bloom);
-ptComposer.addPass(new OutputPass()); ptComposer.addPass(filmic);
+// the path tracer (and its BVH library) is a separate chunk, fetched the first time Cycles is selected
+let pt = null, ptComposer = null, ptTexPass = null, denoise = null, denoisePass = null, ptLoading = null;
+function ensurePT() {
+  return ptLoading ??= import('three-gpu-pathtracer').then(({ WebGLPathTracer, DenoiseMaterial }) => {
+    pt = new WebGLPathTracer(renderer);
+    Object.assign(pt, { renderToCanvas: false, minSamples: 1, renderDelay: 0, fadeDuration: 0, dynamicLowRes: false });
+    pt.tiles.set(1, 1);   // whole frame per sample: more samples/sec (UI stays usable at the lower render scales)
+    ptComposer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType }));
+    ptTexPass = new TexturePass(null);
+    denoise = new DenoiseMaterial(); denoise.toneMapped = false;
+    denoisePass = new ShaderPass(denoise, 'map');
+    ptComposer.addPass(ptTexPass); ptComposer.addPass(denoisePass); ptComposer.addPass(sanitize); ptComposer.addPass(bloom);
+    ptComposer.addPass(new OutputPass()); ptComposer.addPass(filmic);
+    ptSceneDirty = true;
+  });
+}
 let ptReady = false, ptBuilding = false, ptBuildTimer = 0;
 
 // ---------- textures (baked from the Blender procedural armor) ----------
@@ -283,6 +289,23 @@ const emissiveMats = new Map();   // material -> base emissiveIntensity
 // every body material becomes MeshPhysicalMaterial (one shared instance per glTF material) so the
 // "spacecraft" looks can use clearcoat / anisotropy / iridescence; `base` keeps the exported values
 const physCache = new Map(), physMats = [];
+// roughness floor applied INSIDE the shader after the roughness map: the material-level value only scales the map, so a
+// smooth patch in a texture would still mirror the sun (the white blown-out panels); this caps every texel
+const ROUGH_MIN = { value: 0 };
+function addRoughFloor(p) {
+  p.onBeforeCompile = sh => {
+    sh.uniforms.uRoughMin = ROUGH_MIN;
+    sh.fragmentShader = sh.fragmentShader.replace('void main() {', 'uniform float uRoughMin;\nvoid main() {')
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n\troughnessFactor = max( roughnessFactor, uRoughMin );')
+      // specular anti-aliasing (Tokuyoshi-Kaplanyan): where the shading normal (bevels, normal maps) turns faster than a
+      // pixel, widen the lobe by that variance, so sub-pixel glints spread out instead of popping on and off frame to frame
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+	{ vec3 dnx = dFdx( normal ), dny = dFdy( normal );
+	  float nv = min( 0.25, 0.75 * ( dot( dnx, dnx ) + dot( dny, dny ) ) );
+	  roughnessFactor = sqrt( clamp( roughnessFactor * roughnessFactor + nv, 0.0, 1.0 ) ); }`);
+  };
+  p.customProgramCacheKey = () => 'roughfloor+specaa';
+}
 function toPhysical(m) {
   if (!m || physCache.has(m)) return physCache.get(m) ?? m;
   let p = m;
@@ -290,6 +313,7 @@ function toPhysical(m) {
   p.userData.base = { color: p.color.clone(), roughness: p.roughness, metalness: p.metalness, clearcoat: p.clearcoat, clearcoatRoughness: p.clearcoatRoughness, env: p.envMapIntensity,
     maps: Object.fromEntries(['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap', 'alphaMap', 'bumpMap'].map(k => [k, p[k]])),
     emissive: p.emissive.clone(), emissiveIntensity: p.emissiveIntensity, transparent: p.transparent };
+  addRoughFloor(p);
   physCache.set(m, p); physMats.push(p); return p;
 }
 const flames = [], shocks = [], flashes = [], engines = [];
@@ -357,8 +381,9 @@ const starGeo = new THREE.BufferGeometry();
 {
   const pos = new Float32Array(STAR_N * 6), end = new Float32Array(STAR_N * 2), seed = new Float32Array(STAR_N * 2);
   for (let i = 0; i < STAR_N; i++) {
-    // keep a clear tube around the ship so no streak crosses the hull
-    const r = 5 + Math.pow(Math.random(), 0.7) * 70, a = Math.random() * Math.PI * 2, z = (Math.random() * 2 - 1) * STAR_HALF, k = Math.random();
+    // keep a wide clear tube around the ship so no streak crosses the hull or flies past the lens
+    const r = 14 + Math.pow(Math.random(), 0.7) * 70,   // starts beyond the chase camera: no star ever sits between lens and hull
+      a = Math.random() * Math.PI * 2, z = (Math.random() * 2 - 1) * STAR_HALF, k = Math.random();
     for (let j = 0; j < 2; j++) { pos.set([Math.cos(a) * r, Math.sin(a) * r, z], (i * 2 + j) * 3); end[i * 2 + j] = j; seed[i * 2 + j] = k; }
   }
   starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -372,11 +397,13 @@ const stars = new THREE.LineSegments(starGeo, new THREE.ShaderMaterial({
   vertexShader: `attribute float aEnd, aSeed; uniform float uTravel, uLen, uHalf, uFade; varying float vA;
     void main() {
       vec3 p = position; float sp = 0.6 + 0.8 * aSeed;
-      p.z = mod(p.z - uTravel * sp + uHalf, 2.0 * uHalf) - uHalf - aEnd * uLen * sp;
-      vA = (1.0 - aEnd * 0.95) * smoothstep(uHalf, uHalf * 0.6, abs(p.z)) * uFade * (0.35 + 0.65 * aSeed);
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      p.z = mod(p.z - uTravel * sp + uHalf, 2.0 * uHalf) - uHalf - aEnd * max(uLen, 0.35) * sp;   // >= 0.35 m: a 1-px dot shimmers
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      vA = (1.0 - aEnd * 0.95) * smoothstep(uHalf, uHalf * 0.6, abs(p.z)) * uFade * (0.35 + 0.65 * aSeed)
+         * smoothstep(10.0, 25.0, -mv.z);   // fade out well before the lens
+      gl_Position = projectionMatrix * mv;
     }`,
-  fragmentShader: 'uniform vec3 uCol; uniform float uInt; varying float vA; void main() { gl_FragColor = vec4(uCol * 2.2 * uInt, vA); }',
+  fragmentShader: 'uniform vec3 uCol; uniform float uInt; varying float vA; void main() { gl_FragColor = vec4(uCol * 1.2 * uInt, vA); }'   // below the bloom knee,
 }));
 stars.frustumCulled = false; stars.visible = false; scene.add(stars);
 
@@ -820,7 +847,7 @@ const DEFAULTS = {
   ptQuality: 'Nhanh', ptBounces: 3, ptMaxSamples: 128, ptScale: 0.5, ptFilter: 1, ptDenoise: true, ptDenoiseStr: 5,
   spSpeed: 55, spDensity: 1, spLen: 2.2, spInt: 1, spColor: '#cfe0ff',
   spBank: 4, spPitch: 2, spYaw: 1.7, spBob: 0.12, spSwaySpeed: 1, spWheels: true, spWheelSpeed: 15, spHubSpeed: 540,
-  masterVol: 1, camFront: true, camFrontAngle: 25, chatOn: true, chatVol: 0.6, chatEvery: 25, spEngine: true, spEngineVol: 0.5, spEngineTake: 1, stLook: 22, stTwist: 6, stSpeed: 1, stHips: true, coreSpeed: 20, maskTime: 0.5,
+  masterVol: 1, autoRes: true, xformSet: 'default', camFront: true, camFrontAngle: 25, chatOn: true, chatVol: 0.6, chatEvery: 25, spEngine: true, spEngineVol: 0.5, spEngineTake: 1, spEngineXform: true, stLook: 22, stTwist: 6, stSpeed: 1, stHips: true, coreSpeed: 20, maskTime: 0.5,
   rnCycle: 0.9, rnStride: 1, rnLean: 12, rnArm: 1, rnBounce: 1, rnSound: true, rnStompVol: 1, rnShake: 1, rnGrid: true, rnGridColor: '#2f6b3a',
   sun: false, sunAz: 35, sunEl: 20, sunInt: 4, sunColor: '#fff1dc', sunSize: 3, sunCorona: 1, sunDiskInt: 1, flare: true, flareInt: 1,
 };
@@ -837,6 +864,9 @@ const ENGINE_OVERRIDE = {
   Workbench: { view: 'Standard', bloom: false, ao: true, aoInt: 1, shadowRes: 2048, envInt: 1, hdri: 'Studio', bgMode: 'Màu', bgColor: '#3d3d3d' },
 };
 const STORE = 'autobot-render-v2';
+// render-resolution ceiling: touch screens start at ×1.5; with 'autoRes' it drops 0.25 at a time while the frame rate
+// sags below ~40 fps and climbs back after a few smooth seconds
+let resCap = matchMedia('(pointer: coarse)').matches ? 1.5 : Infinity, resGood = 0, resBad = 0, resDrops = 0;
 const PRESET_KEY = 'autobot-presets', LAST_PRESET_KEY = 'autobot-preset-last';
 const presets = VIEWER ? {} : (() => { try { return JSON.parse(localStorage.getItem(PRESET_KEY) || '{}'); } catch (e) { return {}; } })();
 // first visit (nothing saved in this browser): start from the presets shipped with the site
@@ -854,10 +884,21 @@ S.tex = structuredClone(S.tex ?? {});   // per-material texture sets: { [materia
 delete S.sunOrbit;   // the sun no longer orbits on its own
 if (!S.ptQuality) Object.assign(S, { ptQuality: 'Nhanh' }, PT_QUALITY['Nhanh']);   // older saved state: start on the fast profile
 const BUILTIN_HDRI = { Studio: roomEnv, 'Không': null };
-const SHIPPED_HDRI = ['HDR_hazy_nebulae', 'HDR_blue_nebulae_1'];   // public/hdri/<name>.hdr, loaded in the background; not deletable
+// shipped environments (not deletable), fetched only when selected: 2K .hdr ~6 MB each, the AI 'space_soft' panorama ~170 KB
+const SHIPPED_HDRI = { HDR_hazy_nebulae: 'hdri/HDR_hazy_nebulae.hdr', HDR_blue_nebulae_1: 'hdri/HDR_blue_nebulae_1.hdr', space_soft: 'hdri/space_soft.jpg' };
+const hdriLoading = {};
+function loadShippedHdri(n) {
+  if (hdriTex[n] || !SHIPPED_HDRI[n]) return Promise.resolve();
+  return hdriLoading[n] ??= (async () => {
+    const url = BASE + SHIPPED_HDRI[n];
+    const t = url.endsWith('.hdr') ? await new HDRLoader().loadAsync(url) : ldrToData(await tl.loadAsync(url));
+    t.mapping = THREE.EquirectangularReflectionMapping; hdriTex[n] ??= t;
+    if (S.hdri === n) { apply(); refreshAll(); }
+  })().catch(() => {});
+}
 const hdriTex = { ...BUILTIN_HDRI };
 const wantedHdri = S.hdri;   // may be an imported HDRI that is restored from IndexedDB below
-if (!(S.hdri in hdriTex)) S.hdri = 'Studio';
+if (!(S.hdri in hdriTex) && !(S.hdri in SHIPPED_HDRI)) S.hdri = 'Studio';
 const TONE = { AgX: THREE.AgXToneMapping, Filmic: THREE.ACESFilmicToneMapping, Neutral: THREE.NeutralToneMapping, Reinhard: THREE.ReinhardToneMapping,
   Cineon: THREE.CineonToneMapping, Linear: THREE.LinearToneMapping, Standard: THREE.NoToneMapping };
 // color-management presets: Blender's AgX looks + Sketchfab-style tone/colour-balance combos. Exposure is left alone
@@ -959,6 +1000,7 @@ const LOOKS = {
 };
 const tmpCol = new THREE.Color();
 function applyLook() {
+  ROUGH_MIN.value = S.roughMin;
   const look = LOOKS[S.look] || {};
   for (const m of physMats) {
     const b = m.userData.base, grp = MAT_GROUP[m.name], L = (grp && look[grp]) || {};
@@ -1061,7 +1103,7 @@ const texLoader = new THREE.TextureLoader();
 function texBaseFor(name) {
   if (!texBase[name]) {
     texBase[name] = { tex: null };
-    const blob = texFiles[name], url = blob ? URL.createObjectURL(blob) : `${BASE}textures/user/${encodeURIComponent(name)}`;
+    const blob = texFiles[name], url = blob ? URL.createObjectURL(blob) : name.includes('/') ? BASE + name : `${BASE}textures/user/${encodeURIComponent(name)}`;
     const done = () => { if (blob) URL.revokeObjectURL(url); };
     texLoader.loadAsync(url).then(t => { texBase[name].tex = t; done(); apply(); }).catch(() => { done(); matPanel?.toast(`Không đọc được "${name}"`); });
   }
@@ -1129,7 +1171,7 @@ const thumbURL = {};
 const ARMOR_THUMB = { map: 'armor_basecolor', normalMap: 'armor_normal', roughnessMap: 'armor_roughness', emissiveMap: 'armor_emission' };
 function texThumb(ch) {
   const name = texCfg(S.texTarget)?.files?.[ch];
-  if (name) return texFiles[name] ? (thumbURL[name] ??= URL.createObjectURL(texFiles[name])) : null;
+  if (name) return texFiles[name] ? (thumbURL[name] ??= URL.createObjectURL(texFiles[name])) : name.includes('/') ? BASE + name : `${BASE}textures/user/${encodeURIComponent(name)}`;
   if (S.texTarget === 'TF_Armor' && S.armorMaps && ARMOR_THUMB[ch]) {
     const lookDropsAlbedo = ch === 'map' && LOOKS[S.look]?.armor?.baseMap === false;
     return lookDropsAlbedo ? null : `${BASE}textures/${ARMOR_THUMB[ch]}.png`;
@@ -1149,9 +1191,11 @@ function apply() {
   const S = { ...SET, ...ENGINE_OVERRIDE[SET.engine] };
   const cycles = S.engine === 'Cycles', wb = S.engine === 'Workbench';
   renderer.toneMapping = TONE[S.view]; renderer.toneMappingExposure = S.exposure;
-  if (renderer.getPixelRatio() !== S.res) { renderer.setPixelRatio(S.res); composer.setPixelRatio(S.res); }
+  const pr = Math.min(S.res, resCap);
+  if (renderer.getPixelRatio() !== pr) { renderer.setPixelRatio(pr); composer.setPixelRatio(pr); }
   // world
-  const env = hdriTex[S.hdri];
+  if (!(S.hdri in hdriTex) && S.hdri in SHIPPED_HDRI) loadShippedHdri(S.hdri);   // shows once it arrives
+  const env = hdriTex[S.hdri] ?? null;
   scene.environment = env; scene.environmentIntensity = S.envInt;
   scene.environmentRotation.y = scene.backgroundRotation.y = THREE.MathUtils.degToRad(S.envRot);
   if (S.bgMode === 'HDRI' && env) { scene.background = env; scene.backgroundBlurriness = S.bgBlur; scene.backgroundIntensity = S.bgInt; }
@@ -1232,7 +1276,7 @@ function savePreset() {
 function loadPreset(name) {
   if (!presets[name]) return;
   Object.assign(S, DEFAULTS, presets[name]); S.tex = structuredClone(presets[name].tex ?? {});
-  if (!(S.hdri in hdriTex)) S.hdri = 'Studio';
+  if (!(S.hdri in hdriTex) && !(S.hdri in SHIPPED_HDRI)) S.hdri = 'Studio';
   presetUI.name = name; try { localStorage.setItem(LAST_PRESET_KEY, name); } catch (e) {}
   apply(); refreshAll(); panel.toast(`Đã tải "${name}"`);
 }
@@ -1251,6 +1295,20 @@ const hdriFile = { type: 'file', title: 'Import HDRI', hint: 'Kéo thả hoặc 
 // space: one hard sun, shadows near-black, the only fill is a cool bounce from a planet below (earthshine), a rim to part
 // the silhouette from the void. studio: key 30-45° off axis, fill 60-90° from the key at 2:1 (product) or 4:1 (drama),
 // rim behind. Exposure is part of each preset because the intensities are balanced against it.
+const XFORM_SETS = {
+  default: { label: 'Transform 1 (gốc)' },
+  starscream: { label: 'Starscream · servo + tấm hợp kim, tua-bin jet', dir: 'starscream' },
+  starscream2: { label: 'Starscream · bản 2', dir: 'starscream', alt: { transform: 'transform_alt' } },
+  megatron: { label: 'Megatron · thép nặng, thuỷ lực trầm', dir: 'megatron' },
+  soundwave: { label: 'Soundwave · điện tử, glitch, dữ liệu', dir: 'soundwave' },
+  g1: { label: 'G1 cổ điển · ratchet hoạt hình 80s', dir: 'g1' },
+};
+// audition: the set's transform sweep, a clank and the ignition back to back
+async function previewXform() {
+  listener.context.resume(); await loadSfx(xformFilesFor(S.xformSet));
+  [['transform', 0, 96, 0.9], ['clank1', 3.2, 24, 0.8], ['clank3', 3.8, 24, 0.8], ['ignition', 4.4, 72, 1]].forEach(([cue, at, len, vol]) =>
+    setTimeout(() => fire({ file: `sfx/${cue}.mp3`, frame: 0, end: len, volume: vol }), at * 1000));
+}
 const LIGHT_KEYS = ['exposure', 'envInt', 'ambient', 'shadows', 'shadowSoft',
   'sun', 'sunAz', 'sunEl', 'sunInt', 'sunColor', 'sunSize', 'sunCorona', 'sunDiskInt', 'flare', 'flareInt',
   'keyInt', 'keyColor', 'keyAz', 'keyEl', 'fillInt', 'fillColor', 'fillCam', 'fillAz', 'fillEl', 'rimInt', 'rimColor', 'rimAz', 'rimEl'];
@@ -1284,6 +1342,71 @@ const LIGHT_PRESETS = {
     keyInt: 0.25, keyColor: '#9fb6ff', keyAz: 20, keyEl: 30, rimInt: 4, rimColor: '#bfe3ff', rimAz: 180, rimEl: 12 },
 };
 const lightUI = { name: '' };
+// worn / rusted metal looks, cinematic but never glaring: AgX roll-off, low wide bloom only above 0.95, roughness floor
+// 0.35 + specular 0.55 (no mirror hot spots), a soft AI space panorama for reflections, one controlled key (sun or studio)
+// plus cool bounce + rim. Textures: AI-generated tileable sets (Magnific) split into PBR maps, 1K JPEG.
+// big panels: 1K colour / normal / roughness / metalness (no height: bump sparkles on a moving ship)
+const pbr = (set, o = {}) => ({ files: { map: `textures/pbr/${set}_basecolor.jpg`, normalMap: `textures/pbr/${set}_normal.jpg`,
+  roughnessMap: `textures/pbr/${set}_roughness.jpg`, metalnessMap: `textures/pbr/${set}_metalness.jpg` },
+  ...TEX_DEF, rep: 1, bump: 0, nrm: 0.7, ...o });
+// small parts: 512 px sets; uniform materials skip the metalness map, lights reuse their colour map as emission
+const pbrS = (set, { metal = true, glow = 0, ...o } = {}) => {
+  const t = pbr(set, { rep: 2, nrm: 0.6, ...o });
+  if (!metal) delete t.files.metalnessMap;
+  if (glow) { t.files.emissiveMap = t.files.map; t.emis = glow; }
+  return t;
+};
+// every other slot gets its own AI set, shared by all cinematic looks
+const SMALL_PARTS = () => ({
+  TF_Glass: pbrS('glass', { metal: false, rep: 1.5 }), TF_Face: pbrS('face', { rep: 1.5 }), TF_Chrome: pbrS('chrome', { rep: 2 }),
+  TF_CoreGlow: pbrS('core', { metal: false, glow: 2.5, rep: 1 }), TF_Exhaust: pbrS('exhaust', { rep: 1.5 }),
+  TF_Red: pbrS('redlight', { metal: false, glow: 3, rep: 2 }), TF_Rubber: pbrS('rubber', { metal: false, rep: 2.5 }),
+  TF_Green: pbrS('greenlight', { metal: false, glow: 2, rep: 2 }),
+});
+const CINE = { engine: 'EEVEE', view: 'AgX', exposure: 1, bloom: true, bloomStr: 0.12, bloomRad: 0.35, bloomThr: 1.4, grain: 0.12, vignette: 0.35, chroma: 0.03,
+  gBright: 0, gTint: 0, gHiAmt: 0, gShAmt: 0, look: 'Gốc (Blender)', roughOff: 0, coat: 0, aniso: 0, envRefl: 0.8, specScale: 0.55, roughMin: 0.42, coatSoft: 0.5,
+  heatTint: false, visorFilm: false, armorMaps: true, glow: 0.45, hdri: 'space_soft', envInt: 0.35, envRot: 0, bgMode: 'Màu', bgColor: '#000000', ground: false,
+  ambient: 0.02, shadows: true, shadowSoft: 3, flare: true, flareInt: 0.25, sunCorona: 0.6, sunDiskInt: 0.8, keyInt: 0, fillCam: false };
+const LOOK_PRESETS = {
+  'Thép chiến trận cũ · cinematic lạnh': { s: { ...CINE, sun: true, sunAz: 110, sunEl: 12, sunInt: 2.8, sunColor: '#ffe2c0', sunSize: 1.5,
+      fillInt: 0.35, fillColor: '#4f6f9f', fillAz: -120, fillEl: -30, rimInt: 1.6, rimColor: '#9fc4ff', rimAz: -165, rimEl: 18,
+      gContrast: 1.12, gSat: 0.9, gTemp: -0.15, gShAmt: 0.2, gShCol: '#2f6f86' },
+    tex: { ...SMALL_PARTS(), TF_Armor: pbr('gunmetal', { rep: 1.1 }), TF_Dark: pbr('rustiron', { rep: 0.8 }), TF_Metal: pbr('gunmetal', { rep: 1.6 }) } },
+  'Sắt gỉ hoang tàn · nắng chiều': { s: { ...CINE, sun: true, sunAz: 70, sunEl: 6, sunInt: 3, sunColor: '#ffcf9a', sunSize: 2,
+      fillInt: 0.3, fillColor: '#3a4f6e', fillAz: -110, fillEl: -20, rimInt: 1.2, rimColor: '#ffb27a', rimAz: -150, rimEl: 15,
+      gContrast: 1.1, gSat: 0.95, gTemp: 0.25, gHiAmt: 0.15, gHiCol: '#ffb070', gShAmt: 0.12, gShCol: '#3a4a66' },
+    tex: { ...SMALL_PARTS(), TF_Armor: pbr('rustiron', { rep: 1, metal: 0.9 }), TF_Dark: pbr('gunmetal', { rep: 0.9 }), TF_Metal: pbr('rustiron', { rep: 1.4, metal: 0.9 }) } },
+  'Đồng cổ · ánh bảo tàng': { s: { ...CINE, sun: false, keyInt: 2.2, keyColor: '#ffe8cc', keyAz: 40, keyEl: 35, envInt: 0.45,
+      fillInt: 0.7, fillColor: '#cdd8ff', fillAz: -55, fillEl: 10, rimInt: 2, rimColor: '#ffffff', rimAz: 175, rimEl: 30,
+      gContrast: 1.05, gSat: 1, gTemp: 0.08 },
+    tex: { ...SMALL_PARTS(), TF_Armor: pbr('brass', { rep: 1.2 }), TF_Dark: pbr('gunmetal', { rep: 0.9 }), TF_Metal: pbr('brass', { rep: 1.6 }) } },
+  'Sơn quân sự bong tróc · tactical': { s: { ...CINE, sun: true, sunAz: 45, sunEl: 25, sunInt: 2.6, sunColor: '#fff1dc', sunSize: 1.2,
+      fillInt: 0.45, fillColor: '#8fa3c0', fillAz: -60, fillEl: 5, rimInt: 1.4, rimColor: '#cfe0ff', rimAz: 170, rimEl: 20,
+      gContrast: 1.2, gSat: 0.7, gTemp: -0.05 },
+    tex: { ...SMALL_PARTS(), TF_Armor: pbr('olivepaint', { rep: 1 }), TF_Dark: pbr('rustiron', { rep: 0.9 }), TF_Metal: pbr('gunmetal', { rep: 1.5 }) } },
+  'Noir kim loại · chỉ viền sáng': { s: { ...CINE, sun: false, keyInt: 0.6, keyColor: '#b9c8ff', keyAz: 30, keyEl: 20, envInt: 0.2,
+      fillInt: 0.15, fillColor: '#6a7fa8', fillCam: true, rimInt: 3, rimColor: '#bfe3ff', rimAz: 180, rimEl: 12,
+      gContrast: 1.25, gSat: 0.6, gTemp: -0.2 },
+    tex: { ...SMALL_PARTS(), TF_Armor: pbr('gunmetal', { rep: 1.1 }), TF_Dark: pbr('rustiron', { rep: 0.8 }), TF_Metal: pbr('gunmetal', { rep: 1.6 }) } },
+};
+const lookUI = { name: '' };
+let lookUndo = null;
+function applyLookPreset(name) {
+  const p = LOOK_PRESETS[name]; if (!p) return;
+  lookUndo = { s: Object.fromEntries(Object.keys(p.s).map(k => [k, S[k]])), tex: structuredClone(S.tex) };
+  Object.assign(S, p.s); S.tex = structuredClone(p.tex);   // the look owns every texture slot
+  apply(); refreshAll(); (lightPanel ?? panel).toast('Đã áp: ' + name + ' — có thể Hoàn tác');
+}
+function lookPresetUndo() {
+  if (!lookUndo) return;
+  Object.assign(S, lookUndo.s); S.tex = lookUndo.tex; lookUndo = null; lookUI.name = '';
+  apply(); refreshAll(); (lightPanel ?? panel).toast('Đã hoàn tác preset ánh sáng + vật liệu');
+}
+const LOOK_SECTION = () => ({ type: 'section', title: 'Preset ánh sáng + vật liệu (cinematic)', open: true, controls: [
+  { type: 'select', key: 'name', state: lookUI, label: 'Kim loại cũ · rỉ sét · không chói', options: () => ['(chọn preset)', ...Object.keys(LOOK_PRESETS)], onPick: v => applyLookPreset(v) },
+  { type: 'note', text: 'Đổi cùng lúc đèn, mặt trời, HDRI, texture kim loại cũ/rỉ (AI), độ bóng và màu. Lửa, âm thanh, camera giữ nguyên. Bấm Save để giữ.' },
+  { type: 'button', label: 'Hoàn tác preset ánh sáng + vật liệu', onClick: () => lookPresetUndo() },
+] });
 let lightUndo = null;
 function applyLightPreset(name) {
   const p = LIGHT_PRESETS[name]; if (!p) return;
@@ -1295,15 +1418,15 @@ function lightPresetUndo() {
   Object.assign(S, lightUndo); lightUndo = null; lightUI.name = ''; apply(); refreshAll(); lightPanel?.toast('Đã hoàn tác preset ánh sáng');
 }
 let matPanel = null;
-let lightPanel = null;
-function refreshAll() { panel.refresh(); matPanel?.refresh(); lightPanel?.refresh(); }
+let lightPanel = null, soundPanel = null;
+function refreshAll() { panel.refresh(); matPanel?.refresh(); lightPanel?.refresh(); soundPanel?.refresh(); }
 const panel = createPanel({
   title: 'Render', state: S, defaults: DEFAULTS, storageKey: 'autobot-panel',
   footerActions: () => [{ label: 'Save', primary: true, title: 'Lưu các setting hiện tại thành preset', onClick: () => savePreset() }],
   onChange: k => {
     if (k === 'ptQuality') Object.assign(S, PT_QUALITY[S.ptQuality]);
     else if (k.startsWith?.('pt')) S.ptQuality = 'Tuỳ chỉnh';
-    apply(); matPanel?.refresh(); lightPanel?.refresh();
+    apply(); refreshAll();
   },
   schema: [
     { type: 'segmented', key: 'engine', large: true, options: [{ value: 'EEVEE', label: 'EEVEE' }, { value: 'Cycles', label: 'Cycles' }, { value: 'Workbench', label: 'Workbench' }] },
@@ -1351,18 +1474,9 @@ const panel = createPanel({
       { type: 'slider', key: 'spYaw', label: 'Lắc hướng (yaw)', min: 0, max: 15, step: 0.1, unit: '°' },
       { type: 'slider', key: 'spBob', label: 'Nhấp nhô', min: 0, max: 1, step: 0.01, unit: ' m' },
       { type: 'slider', key: 'spSwaySpeed', label: 'Nhịp chòng chành', min: 0, max: 4, step: 0.01, format: v => '×' + (+v).toFixed(2) },
-      { type: 'switch', key: 'spEngine', label: 'Tiếng động cơ' },
-      { type: 'slider', key: 'spEngineVol', label: 'Âm lượng động cơ', min: 0, max: 2, step: 0.01, when: s => s.spEngine },
-      { type: 'segmented', key: 'spEngineTake', label: 'Bản tiếng', options: [{ value: 1, label: 'Bản 1' }, { value: 2, label: 'Bản 2' }], when: s => s.spEngine },
       { type: 'switch', key: 'spWheels', label: 'Bánh xe quay' },
       { type: 'slider', key: 'spWheelSpeed', label: 'Tốc độ bánh', min: 0, max: 120, step: 1, unit: '°/s', when: s => s.spWheels },
       { type: 'slider', key: 'spHubSpeed', label: 'Tốc độ lõi bánh', min: 0, max: 1440, step: 1, unit: '°/s' },
-    ] },
-    { type: 'section', title: 'Âm thanh', open: true, controls: [
-      { type: 'slider', key: 'masterVol', label: 'Âm lượng tổng', min: 0, max: 2, step: 0.01, format: v => Math.round(v * 100) + '%' },
-      { type: 'switch', key: 'chatOn', label: 'Tiếng robot liên lạc (khi bay vũ trụ)' },
-      { type: 'slider', key: 'chatVol', label: 'Âm lượng liên lạc', min: 0, max: 2, step: 0.01, when: s => s.chatOn },
-      { type: 'slider', key: 'chatEvery', label: 'Khoảng cách trung bình', min: 5, max: 120, step: 1, unit: ' s', when: s => s.chatOn },
     ] },
     { type: 'section', title: 'Robot', open: true, controls: [
       { type: 'button', label: 'Mở / đóng mặt nạ', primary: true, onClick: () => $('mask').click() },
@@ -1385,8 +1499,6 @@ const panel = createPanel({
       { type: 'slider', key: 'rnLean', label: 'Đổ người về trước', min: 0, max: 30, step: 0.5, unit: '°' },
       { type: 'slider', key: 'rnArm', label: 'Vung tay', min: 0, max: 2, step: 0.01, format: v => '×' + (+v).toFixed(2) },
       { type: 'slider', key: 'rnBounce', label: 'Nảy (lúc bay người)', min: 0, max: 3, step: 0.01, format: v => '×' + (+v).toFixed(2) },
-      { type: 'switch', key: 'rnSound', label: 'Tiếng dậm chân (uỳnh)' },
-      { type: 'slider', key: 'rnStompVol', label: 'Âm lượng dậm', min: 0, max: 3, step: 0.01, when: s => s.rnSound },
       { type: 'slider', key: 'rnShake', label: 'Rung camera mỗi bước', min: 0, max: 3, step: 0.01 },
       { type: 'switch', key: 'rnGrid', label: 'Lưới mặt đất khi chạy' },
       { type: 'color', key: 'rnGridColor', label: 'Màu lưới', when: s => s.rnGrid },
@@ -1422,6 +1534,7 @@ const panel = createPanel({
     ] },
     { type: 'section', title: 'Hiệu năng', controls: [
       { type: 'slider', key: 'res', label: 'Độ phân giải', min: 0.5, max: 2, step: 0.05, format: v => '×' + (+v).toFixed(2) },
+      { type: 'switch', key: 'autoRes', label: 'Tự giảm độ phân giải khi giật (<35 fps kéo dài)' },
     ] },
   ],
 });
@@ -1430,8 +1543,9 @@ const panel = createPanel({
 matPanel = createPanel({
   title: 'Vật liệu', state: S, defaults: DEFAULTS, storageKey: 'autobot-mat-panel', className: 'tc-panel--left', resettable: false,
   footerActions: () => [{ label: 'Save', primary: true, title: 'Lưu các setting hiện tại thành preset', onClick: () => savePreset() }],
-  onChange: k => { apply(); panel.refresh(); lightPanel?.refresh(); if (k === 'texTarget') highlightMat(S.texTarget); },
+  onChange: k => { apply(); refreshAll(); if (k === 'texTarget') highlightMat(S.texTarget); },
   schema: [
+    LOOK_SECTION(),
     { type: 'section', title: 'Vật liệu', controls: [
       { type: 'slider', key: 'glow', label: 'Glow (đèn xanh)', min: 0, max: 5, step: 0.01 },
       { type: 'color', key: 'glowColor', label: 'Màu glow' },
@@ -1472,20 +1586,53 @@ matPanel = createPanel({
   ],
 });
 // ---------- lighting panel: HDRI / world, sun, soft light & gloss, lamps + shadows ----------
+soundPanel = createPanel({
+  title: 'Âm thanh', state: S, defaults: DEFAULTS, storageKey: 'autobot-sound-panel', className: 'tc-panel--left', resettable: false,
+  footerActions: () => [{ label: 'Save', primary: true, title: 'Lưu các setting hiện tại thành preset', onClick: () => savePreset() }],
+  onChange: k => { if (k === 'xformSet') loadSfx(xformFilesFor(S.xformSet)); apply(); refreshAll(); },
+  schema: [
+    { type: 'section', title: 'Tổng', open: true, controls: [
+      { type: 'slider', key: 'masterVol', label: 'Âm lượng tổng', min: 0, max: 2, step: 0.01, format: v => Math.round(v * 100) + '%' },
+      { type: 'note', text: 'Âm thanh chỉ phát sau lần bấm chuột đầu tiên vào trang (quy định của trình duyệt).' },
+    ] },
+    { type: 'section', title: 'Âm thanh biến hình', open: true, controls: [
+      { type: 'select', key: 'xformSet', label: 'Preset chuỗi âm thanh', options: () => Object.entries(XFORM_SETS).map(([value, v]) => ({ value, label: v.label })) },
+      { type: 'button', label: 'Nghe thử preset', onClick: () => previewXform() },
+      { type: 'note', text: 'Thay tiếng biến hình, 3 tiếng khoá khớp và tiếng đánh lửa trong cả Robot → Jet, Jet → Robot và lúc cất cánh từ trạng thái chạy. Tiếng bật nhảy và tiếp đất giữ nguyên.' },
+    ] },
+    { type: 'section', title: 'Động cơ máy bay', open: true, controls: [
+      { type: 'switch', key: 'spEngine', label: 'Tiếng động cơ' },
+      { type: 'slider', key: 'spEngineVol', label: 'Âm lượng động cơ', min: 0, max: 2, step: 0.01, when: s => s.spEngine },
+      { type: 'segmented', key: 'spEngineTake', label: 'Bản tiếng', options: [{ value: 1, label: 'Bản 1' }, { value: 2, label: 'Bản 2' }], when: s => s.spEngine },
+      { type: 'switch', key: 'spEngineXform', label: 'Cả khi đang biến hình (từ lúc đánh lửa)', when: s => s.spEngine },
+      { type: 'note', text: 'Chạy khi bay vũ trụ, khi cất cánh từ lúc chạy, và (nếu bật) trong clip biến hình: to dần từ lúc đánh lửa, tắt dần khi gập lại thành robot.' },
+    ] },
+    { type: 'section', title: 'Robot liên lạc (khi bay vũ trụ)', open: true, controls: [
+      { type: 'switch', key: 'chatOn', label: 'Bật tiếng liên lạc' },
+      { type: 'slider', key: 'chatVol', label: 'Âm lượng liên lạc', min: 0, max: 2, step: 0.01, when: s => s.chatOn },
+      { type: 'slider', key: 'chatEvery', label: 'Khoảng cách trung bình', min: 5, max: 120, step: 1, unit: ' s', when: s => s.chatOn },
+    ] },
+    { type: 'section', title: 'Bước chân (khi chạy)', open: true, controls: [
+      { type: 'switch', key: 'rnSound', label: 'Tiếng dậm chân (uỳnh)' },
+      { type: 'slider', key: 'rnStompVol', label: 'Âm lượng dậm', min: 0, max: 3, step: 0.01, when: s => s.rnSound },
+    ] },
+  ],
+});
 lightPanel = createPanel({
   title: 'Ánh sáng', state: S, defaults: DEFAULTS, storageKey: 'autobot-light-panel', className: 'tc-panel--left', resettable: false,
   footerActions: () => [{ label: 'Save', primary: true, title: 'Lưu các setting hiện tại thành preset', onClick: () => savePreset() }],
-  onChange: () => { apply(); panel.refresh(); matPanel.refresh(); },
+  onChange: () => { apply(); refreshAll(); },
   schema: [
+    LOOK_SECTION(),
     { type: 'section', title: 'Preset ánh sáng', open: true, controls: [
       { type: 'select', key: 'name', state: lightUI, label: 'Preset (mặt trời + 3 đèn studio)', options: () => ['(chọn preset)', ...Object.keys(LIGHT_PRESETS)], onPick: v => applyLightPreset(v) },
       { type: 'note', text: 'Chỉ đổi đèn, mặt trời, bóng đổ, cường độ HDRI và exposure. Vật liệu, màu, bloom giữ nguyên. Bấm Save để giữ.' },
       { type: 'button', label: 'Hoàn tác preset ánh sáng', onClick: () => lightPresetUndo() },
     ] },
     { type: 'section', title: 'World', open: true, controls: [
-      { type: 'select', key: 'hdri', label: 'HDRI', options: () => Object.keys(hdriTex) },
+      { type: 'select', key: 'hdri', label: 'HDRI', options: () => [...new Set([...Object.keys(hdriTex), ...Object.keys(SHIPPED_HDRI)])] },
       hdriFile,
-      { type: 'button', label: 'Xoá HDRI đang chọn', confirm: true, confirmLabel: 'Bấm lần nữa để xoá', when: s => !(s.hdri in BUILTIN_HDRI) && !SHIPPED_HDRI.includes(s.hdri), onClick: () => deleteHDRI() },
+      { type: 'button', label: 'Xoá HDRI đang chọn', confirm: true, confirmLabel: 'Bấm lần nữa để xoá', when: s => !(s.hdri in BUILTIN_HDRI) && !(s.hdri in SHIPPED_HDRI), onClick: () => deleteHDRI() },
       { type: 'slider', key: 'envInt', label: 'Strength', min: 0, max: 5, step: 0.01 },
       { type: 'slider', key: 'envRot', label: 'Rotation', min: -180, max: 180, step: 1, unit: '°' },
       { type: 'segmented', key: 'bgMode', label: 'Nền', options: [{ value: 'HDRI', label: 'HDRI' }, { value: 'Màu', label: 'Màu đơn' }] },
@@ -1542,8 +1689,9 @@ const SIDE_KEY = 'autobot-side-open';
 const ICONS = {
   mat: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="7.2"/><path d="M4.2 7.2c2.6 1.6 9 1.6 11.6 0M3.4 11.2c3 2 10.2 2 13.2 0"/><path d="M10 2.8c-2.2 2.2-2.2 12.2 0 14.4"/></svg>',
   light: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="3.6"/><path d="M10 1.8v2.4M10 15.8v2.4M1.8 10h2.4M15.8 10h2.4M4.2 4.2l1.7 1.7M14.1 14.1l1.7 1.7M4.2 15.8l1.7-1.7M14.1 5.9l1.7-1.7"/></svg>',
+  sound: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M3 8h3l4-3.5v11L6 12H3z"/><path d="M13 7.2a3.6 3.6 0 0 1 0 5.6M15.3 5a6.6 6.6 0 0 1 0 10"/></svg>',
 };
-const SIDE_PANELS = { mat: { panel: matPanel, title: 'Vật liệu' }, light: { panel: lightPanel, title: 'Ánh sáng' } };
+const SIDE_PANELS = { mat: { panel: matPanel, title: 'Vật liệu' }, light: { panel: lightPanel, title: 'Ánh sáng' }, sound: { panel: soundPanel, title: 'Âm thanh' } };
 Object.entries(SIDE_PANELS).forEach(([id, sp], i) => {
   sp.btn = Object.assign(document.createElement('button'), { className: 'tc-fab tc-surface', title: sp.title, innerHTML: ICONS[id] });
   sp.btn.setAttribute('aria-label', 'Mở bảng ' + sp.title); sp.btn.style.left = (12 + i * 52) + 'px';
@@ -1611,7 +1759,7 @@ async function loadHDRI(file) {
   } catch (e) { alert('Không đọc được HDRI: ' + e.message); }
 }
 function deleteHDRI() {
-  const n = S.hdri; if (n in BUILTIN_HDRI || SHIPPED_HDRI.includes(n)) return;
+  const n = S.hdri; if (n in BUILTIN_HDRI || n in SHIPPED_HDRI) return;
   hdriTex[n]?.dispose(); delete hdriTex[n]; idb.del(n); S.hdri = 'Studio'; apply(); refreshAll();
 }
 boot.waits.push(idb.all('tex').then(list => { list.forEach(([name, file]) => { texFiles[name] = file; }); if (list.length) { apply(); refreshAll(); } }));
@@ -1621,9 +1769,7 @@ boot.waits.push(idb.all().then(async list => {
   if (wantedHdri in hdriTex) S.hdri = wantedHdri;
   if (list.length) { apply(); refreshAll(); }
 }));
-boot.waits.push(Promise.all(SHIPPED_HDRI.map(async n => {
-  try { const t = await new HDRLoader().loadAsync(`${BASE}hdri/${n}.hdr`); t.mapping = THREE.EquirectangularReflectionMapping; hdriTex[n] ??= t; } catch (e) {}
-})).then(() => { if (wantedHdri in hdriTex) S.hdri = wantedHdri; apply(); refreshAll(); }));
+boot.waits.push(loadShippedHdri(wantedHdri).then(() => { if (wantedHdri in hdriTex) S.hdri = wantedHdri; apply(); refreshAll(); }));   // only the one in use
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadHDRI(f); });
 apply();
@@ -1633,11 +1779,22 @@ const listener = new THREE.AudioListener(); camera.add(listener);
 const aload = new THREE.AudioLoader();
 const buffers = {};
 const HUMS = ['sfx/engine_hum1.mp3', 'sfx/engine_hum2.mp3'];   // AI-generated seamless cruise loops
+// transform sound sets (AI-generated, public/sfx/xform/<set>/): each swaps the character cues of the authored
+// transform chain — the long transform sweep, the three lock-in clanks and the ignition; leap / landing stay physical
+const XFORM_CUES = ['transform', 'clank1', 'clank2', 'clank3', 'ignition'];
+const xformFilesFor = k => { const v = XFORM_SETS[k]; return v?.dir ? XFORM_CUES.map(c => `sfx/xform/${v.dir}/${v.alt?.[c] ?? c}.mp3`) : []; };
+const sfxLoading = {};
+const loadSfx = files => Promise.all(files.map(f => sfxLoading[f] ??= aload.loadAsync(BASE + f).then(b => { buffers[f] = b; }).catch(() => {})));
+const xformFile = file => {
+  const set = XFORM_SETS[S.xformSet], cue = /^sfx\/(\w+)\.mp3$/.exec(file)?.[1];
+  return set?.dir && XFORM_CUES.includes(cue) ? `sfx/xform/${set.dir}/${set.alt?.[cue] ?? cue}.mp3` : file;
+};
 const CHATTER = Array.from({ length: 10 }, (_, i) => `sfx/chatter${i + 1}.mp3`);   // AI-generated garbled robot comm bursts
-await Promise.all([...new Set([...meta.sfx.map(c => c.file), ...STOMPS, ...HUMS, ...CHATTER])].map(async f => { buffers[f] = await aload.loadAsync(BASE + f); }));
+await Promise.all([...new Set([...meta.sfx.map(c => c.file), ...STOMPS, ...HUMS, ...CHATTER, ...xformFilesFor(S.xformSet)])].map(async f => { buffers[f] = await (sfxLoading[f] = aload.loadAsync(BASE + f)); }));   // only the transform set in use
 const live = [];
 function fire(c) {
-  const a = new THREE.Audio(listener); a.setBuffer(buffers[c.file]); a.setVolume(c.volume);
+  const file = xformFile(c.file); if (!buffers[file]) return;
+  const a = new THREE.Audio(listener); a.setBuffer(buffers[file]); a.setVolume(c.volume);
   a.play(); live.push(a);
   const dur = (c.end - c.frame) / FPS; setTimeout(() => { try { a.stop(); } catch (e) {} }, dur * 1000);
 }
@@ -1662,15 +1819,19 @@ function updateChatter(dt) {
   chatterIn = S.chatEvery * (0.6 + Math.random() * 0.8);   // ±40% around the chosen spacing
 }
 function updateHum(dt) {
-  const flying = cruise || (launching && cur > 102);
-  const target = S.spEngine && flying ? S.spEngineVol : 0;
+  // jet form inside the transform clips: spools up at ignition (frame 102), holds through the hover,
+  // dies away as the jet folds back into the robot (jet -> robot 150-200)
+  const xform = S.spEngineXform && !cruise && !launching && !running && !standing
+    ? THREE.MathUtils.smoothstep(cur, 98, 112) * (1 - THREE.MathUtils.smoothstep(cur, 165, 198)) : 0;
+  const flying = cruise || (launching && cur > 102) ? 1 : xform;
+  const target = S.spEngine ? S.spEngineVol * flying : 0;
   humVol += (target - humVol) * Math.min(1, dt * 1.5);
   const take = HUMS[S.spEngineTake - 1] || HUMS[0];
   if (humVol > 0.002) {
     if (take !== humTake) { if (hum.isPlaying) hum.stop(); hum.setBuffer(buffers[take]); hum.setLoopStart(0.03); hum.setLoopEnd(buffers[take].duration - 0.03); humTake = take; }
     if (!hum.isPlaying && listener.context.state === 'running') hum.play();
     hum.setVolume(humVol);
-    hum.setPlaybackRate(launching ? 0.9 + Math.min(0.3, LS.v / 300) : 1);   // spools up with the launch speed
+    hum.setPlaybackRate(launching ? 0.9 + Math.min(0.3, LS.v / 300) : cruise ? 1 : 0.8 + 0.2 * xform);   // spools up with the launch / ignition
   } else if (hum.isPlaying) hum.pause();
 }   // master volume goes through the listener, so every sound (clips, stomps, mask) follows it
 
@@ -1822,7 +1983,16 @@ renderer.setAnimationLoop(() => {
   updateRobotExtras(dt);
   updateHighlight(dt);
   scrub.draw(); $('frame').textContent = cruise ? 'vũ trụ' : running ? 'chạy' : standing ? 'đứng' : launching ? 'cất cánh' : 'f ' + Math.round(cur);
-  fpsN++; fpsT += dt; if (fpsT > 0.5) { panel.setStatus(`${Math.round(fpsN / fpsT)} fps · ${renderer.domElement.width}×${renderer.domElement.height}`); fpsN = fpsT = 0; }
+  fpsN++; fpsT += dt;
+  if (fpsT > 1) {
+    const fps = fpsN / fpsT, pr = renderer.getPixelRatio();
+    panel.setStatus(`${Math.round(fps)} fps · ${renderer.domElement.width}×${renderer.domElement.height}`); fpsN = fpsT = 0;
+    if (S.autoRes && !boot.shown && document.visibilityState === 'visible') {
+      resBad = fps < 35 ? resBad + 1 : 0; resGood = fps > 58 ? resGood + 1 : 0;
+      if (resBad >= 2 && pr > 0.75) { resCap = Math.max(0.75, pr - 0.25); resBad = resGood = 0; resDrops++; apply(); }
+      else if (resGood >= 6 && pr < S.res && resDrops < 2) { resCap = pr + 0.25; resGood = 0; apply(); }
+    }
+  }
   engines.forEach(e => { e.l.intensity = S.flames ? S.flameLight * 8 * Math.max(e.o.scale.x, e.o.scale.z) * S.flameInt : 0; });
   shocks.forEach(o => { const k = o.scale.x / (shockMax[o.name] || 1); o.material.uniforms.uFade.value = Math.pow(Math.max(0, 1 - k), 1.3); });
   if (rootBone) {
@@ -1891,6 +2061,7 @@ function ptSync() {
 // returns true when the path-traced image was drawn this frame
 function renderPathTraced() {
   if (S.engine !== 'Cycles' || playing || cruise || running || launching || standing) return false;
+  if (!pt) { ensurePT(); panel.setSubtitle('đang tải path tracer…'); return false; }
   if (ptSceneDirty && !ptBuilding) {
     clearTimeout(ptBuildTimer); ptBuilding = true;
     ptBuildTimer = setTimeout(() => { ptBuilding = false; ptBuild(); }, 250);   // debounce scrubbing
@@ -1919,17 +2090,22 @@ const occluders = bodyMeshes.filter(o => o.isSkinnedMesh).map(o => {
   const bi = o.geometry.attributes.skinIndex ? o.geometry.attributes.skinIndex.getX(0) : 0;
   return { o, bone: o.skeleton.bones[bi], inv: o.skeleton.boneInverses[bi], sph: o.geometry.boundingSphere };
 });
+// 0..1 how much the hull covers the sun: graded by how deep the sun ray passes inside a part's sphere, so a swaying ship
+// fades the flare in and out instead of toggling it every frame (the old yes/no test strobed the whole screen)
 function sunOccluded() {
   rayOrigin.copy(camera.position);
   if (S.ground && sunDir.y < 0) return 1;
+  let occ = 0;
   for (const { o, bone, inv, sph } of occluders) {
     mTmp.multiplyMatrices(o.matrixWorld, o.bindMatrixInverse).multiply(bone.matrixWorld).multiply(inv).multiply(o.bindMatrix);
     sphC.copy(sph.center).applyMatrix4(mTmp);
     const r = sph.radius * 0.75; sphC.sub(rayOrigin);
     const tc = sphC.dot(sunDir); if (tc < 0) continue;
-    if (sphC.lengthSq() - tc * tc < r * r) return 1;
+    const miss = Math.sqrt(Math.max(0, sphC.lengthSq() - tc * tc)) / r;   // < 1: the ray goes through the sphere
+    occ = Math.max(occ, THREE.MathUtils.smoothstep(1.25 - miss, 0, 0.6));
+    if (occ >= 1) return 1;
   }
-  return 0;
+  return occ;
 }
 function updateSun(dt) {
   const az = THREE.MathUtils.degToRad(S.sunAz), el = THREE.MathUtils.degToRad(S.sunEl);
@@ -1945,7 +2121,7 @@ function updateSun(dt) {
   const inFront = sunNDC.z < 1 && sunDir.dot(camera.getWorldDirection(sphC)) > 0;
   const edge = Math.max(Math.abs(sunNDC.x), Math.abs(sunNDC.y));
   const target = inFront ? (1 - THREE.MathUtils.smoothstep(edge, 0.9, 1.4)) * (1 - sunOccluded()) : 0;
-  flareVis += (target - flareVis) * Math.min(1, dt * 12);
+  flareVis += (target - flareVis) * Math.min(1, dt * 3);   // slow, smooth fade
   const aspect = innerWidth / innerHeight;
   flareCam.left = -aspect; flareCam.right = aspect; flareCam.updateProjectionMatrix();
   flares.forEach(f => {
@@ -1956,6 +2132,6 @@ function updateSun(dt) {
 }
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); ptComposer.setSize(innerWidth, innerHeight); gtao.setSize(innerWidth, innerHeight);
-  pt.updateCamera();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); ptComposer?.setSize(innerWidth, innerHeight); gtao.setSize(innerWidth, innerHeight);
+  pt?.updateCamera();
 });
